@@ -19,7 +19,7 @@ function extractResponseText(payload) {
     .trim();
 }
 
-function buildImagePrompt({ transcript, gestures, strokes, mode, visualAnalysis }) {
+function buildImagePrompt({ transcript, gestures, strokes, mode, visualAnalysis, previousBrief, visualHistory }) {
   const speech = transcript?.trim() || "The teacher is explaining a concept.";
   const gestureSummary = gestures?.length
     ? gestures.slice(-8).map((item) => `${item.label} (${item.score})`).join(", ")
@@ -31,14 +31,27 @@ function buildImagePrompt({ transcript, gestures, strokes, mode, visualAnalysis 
         .join("; ")
     : "No visible tracing yet.";
   const sceneSummary = visualAnalysis?.trim() || "No camera scene analysis yet.";
+  const continuity = previousBrief?.trim()
+    ? `Continue and refine the previous visual instead of restarting: ${previousBrief.trim()}`
+    : "This may be the first visual. Establish a simple reusable diagram foundation.";
+  const historySummary = Array.isArray(visualHistory) && visualHistory.length
+    ? visualHistory
+        .slice(0, 3)
+        .map((item, index) => `visual ${index + 1}: ${item.mode || "diagram"} at ${item.time || "recent"} - ${item.brief || "no brief"}`)
+        .join("; ")
+    : "No previous visual history.";
 
   return [
     "Create one clear educational visual aid for a live teacher overlay.",
-    "The image should be instantly readable in a small corner of the screen.",
+    "The image should be instantly readable in a screen overlay and useful for deaf or hard-of-hearing learners following the lesson visually.",
     "Use a clean infographic, classroom diagram, or whiteboard visual that directly follows the current lesson.",
+    "Preserve continuity: evolve the active idea, add the new concept, and avoid changing style or subject unless the lesson clearly moved on.",
+    "If the teacher traced arrows, circles, comparisons, or paths, convert those gestures into semantic arrows, highlights, groupings, or process flow.",
     "Prioritize the latest camera scene analysis over generic assumptions when choosing what to draw.",
     "Reflect the teacher's visible pointing, board content, objects, and traced hand paths when they are pedagogically meaningful.",
     "Do not include photorealistic people, clutter, tiny text, brand marks, watermarks, or UI chrome.",
+    continuity,
+    `Recent visual history: ${historySummary}`,
     `Lesson context: ${speech}`,
     `Camera scene analysis: ${sceneSummary}`,
     `Detected gestures: ${gestureSummary}`,

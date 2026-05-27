@@ -187,7 +187,6 @@ h2 {
   position: absolute;
   z-index: 4;
   top: 96px;
-  right: 24px;
   width: min(44vw, 680px);
   max-height: calc(100vh - 188px);
   border: 1px solid rgba(255, 255, 255, 0.2);
@@ -197,6 +196,18 @@ h2 {
   box-shadow: 0 26px 90px rgba(0, 0, 0, 0.58);
   overflow: hidden;
   pointer-events: none;
+}
+
+.visual-stage.side-right {
+  right: 24px;
+}
+
+.visual-stage.side-left {
+  left: 24px;
+}
+
+.visual-stage.expanded {
+  width: min(58vw, 880px);
 }
 
 .visual-header {
@@ -210,6 +221,19 @@ h2 {
 
 .visual-header button {
   pointer-events: auto;
+}
+
+.visual-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  pointer-events: auto;
+}
+
+.visual-actions button {
+  min-height: 34px;
+  padding: 0 11px;
+  white-space: nowrap;
 }
 
 .visual-header h2 {
@@ -257,6 +281,72 @@ h2 {
   font-size: 0.8rem;
   font-weight: 700;
   backdrop-filter: blur(12px);
+}
+
+.visual-intel {
+  display: grid;
+  grid-template-columns: 1.2fr 0.8fr;
+  gap: 1px;
+  background: rgba(255, 255, 255, 0.1);
+  border-top: 1px solid rgba(255, 255, 255, 0.12);
+}
+
+.visual-intel div {
+  min-width: 0;
+  padding: 10px 12px;
+  background: rgba(8, 12, 16, 0.72);
+}
+
+.visual-intel span,
+.visual-history span {
+  display: block;
+  color: #8f9ca6;
+  font-size: 0.72rem;
+  font-weight: 700;
+  text-transform: uppercase;
+}
+
+.visual-intel strong {
+  display: block;
+  margin-top: 4px;
+  color: #edf4f8;
+  font-size: 0.8rem;
+  line-height: 1.35;
+  font-weight: 650;
+}
+
+.visual-history {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  min-height: 64px;
+  overflow-x: auto;
+  padding: 10px 12px;
+  pointer-events: auto;
+}
+
+.history-thumb {
+  display: grid;
+  grid-template-columns: 42px 1fr;
+  align-items: center;
+  gap: 8px;
+  min-width: 112px;
+  min-height: 42px;
+  padding: 4px 8px 4px 4px;
+  background: rgba(16, 22, 28, 0.82);
+}
+
+.history-thumb img {
+  width: 42px;
+  height: 42px;
+  border-radius: 6px;
+  object-fit: cover;
+}
+
+.history-thumb span {
+  color: #d7dde2;
+  font-size: 0.72rem;
+  text-transform: none;
 }
 
 .floating-context {
@@ -448,6 +538,19 @@ h2 {
     right: 14px;
   }
 
+  .visual-stage.side-left {
+    left: 14px;
+  }
+
+  .visual-stage.expanded {
+    width: min(66vw, 620px);
+  }
+
+  .visual-header {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+
   .floating-context {
     width: min(50vw, 480px);
   }
@@ -494,6 +597,10 @@ h2 {
 
   .generated-frame {
     aspect-ratio: 1;
+  }
+
+  .visual-intel {
+    grid-template-columns: 1fr;
   }
 
   .debug-drawer {

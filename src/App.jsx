@@ -1,11 +1,12 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { FilesetResolver, GestureRecognizer, DrawingUtils } from "@mediapipe/tasks-vision";
 
-const AUTO_INTERVAL_MS = 8000;
-const FRAME_ANALYSIS_INTERVAL_MS = 4000;
+const AUTO_INTERVAL_MS = 6200;
+const FRAME_ANALYSIS_INTERVAL_MS = 3200;
 const MAX_PARALLEL_GENERATIONS = 3;
 const MAX_EVENTS = 10;
 const MAX_STROKES = 8;
+const MAX_VISUAL_HISTORY = 5;
 const HAND_TRACE_COLORS = ["#ffcf5a", "#61dafb"];
 
 function nowTime() {
@@ -28,6 +29,68 @@ function summarizeLiveStrokes(strokeSets) {
     .map((points, handIndex) => ({ points, handLabel: `Hand ${handIndex + 1}` }))
     .filter(({ points }) => points.length > 1)
     .map(({ points, handLabel }) => summarizeStroke(points, handLabel));
+}
+
+function shortText(value, fallback = "Live lesson context", limit = 92) {
+  const text = String(value || "").replace(/\s+/g, " ").trim();
+  if (!text) return fallback;
+  return text.length > limit ? `${text.slice(0, limit - 1)}...` : text;
+}
+
+function escapeSvgText(value) {
+  return String(value || "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;");
+}
+
+function buildVisualBrief({ transcript, gestures, strokes, mode, visualAnalysis }) {
+  const latestGesture = gestures?.at?.(-1)?.label;
+  const latestStroke = strokes?.at?.(-1);
+  const parts = [
+    mode ? `${mode} visual` : "diagram visual",
+    transcript ? shortText(transcript, "", 118) : "",
+    visualAnalysis ? shortText(visualAnalysis, "", 118) : "",
+    latestGesture ? `gesture: ${latestGesture}` : "",
+    latestStroke ? `trace: ${latestStroke.hand || "hand"} ${latestStroke.direction}` : ""
+  ].filter(Boolean);
+
+  return parts.join(" | ") || "Build a clear visual cue for the current live lesson.";
+}
+
+function makeInstantPreview({ transcript, gestures, strokes, mode, visualAnalysis, generationId }) {
+  const title = mode === "steps" ? "Next teaching step" : mode === "metaphor" ? "Live visual metaphor" : "Live diagram sketch";
+  const topic = shortText(transcript || visualAnalysis, "Listening for lesson context", 72);
+  const cue = shortText(visualAnalysis, gestures?.at?.(-1)?.label || "Watching hands and board", 86);
+  const trace = strokes?.at?.(-1)?.direction || "trace will shape the next image";
+  const accent = mode === "metaphor" ? "#78d6a3" : mode === "steps" ? "#61dafb" : "#f1c45a";
+  const svg = `
+    <svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+      <defs>
+        <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+          <stop offset="0" stop-color="#0b1116"/>
+          <stop offset="1" stop-color="#172129"/>
+        </linearGradient>
+      </defs>
+      <rect width="1024" height="1024" fill="url(#bg)"/>
+      <rect x="76" y="76" width="872" height="872" rx="38" fill="#f6f0dc"/>
+      <path d="M170 654 C272 520 368 604 474 452 S676 318 838 252" fill="none" stroke="${accent}" stroke-width="30" stroke-linecap="round"/>
+      <path d="M210 732 H810" stroke="#24313a" stroke-width="18" stroke-linecap="round" opacity="0.28"/>
+      <circle cx="232" cy="628" r="48" fill="#d65f4b"/>
+      <circle cx="510" cy="424" r="58" fill="#2f7190"/>
+      <circle cx="804" cy="262" r="50" fill="#4e9f86"/>
+      <text x="132" y="174" font-family="Inter, Arial, sans-serif" font-size="52" font-weight="850" fill="#172129">${escapeSvgText(title)}</text>
+      <text x="132" y="252" font-family="Inter, Arial, sans-serif" font-size="34" fill="#24313a">${escapeSvgText(topic)}</text>
+      <rect x="132" y="760" width="760" height="62" rx="18" fill="#172129"/>
+      <text x="164" y="801" font-family="Inter, Arial, sans-serif" font-size="28" fill="#f6f0dc">${escapeSvgText(cue)}</text>
+      <rect x="132" y="842" width="760" height="58" rx="16" fill="#31414a"/>
+      <text x="164" y="880" font-family="Inter, Arial, sans-serif" font-size="26" fill="#f6f0dc">${escapeSvgText(trace)}</text>
+      <text x="764" y="154" font-family="Inter, Arial, sans-serif" font-size="26" font-weight="800" fill="#6a7479">V2.${generationId}</text>
+    </svg>
+  `;
+
+  return `data:image/svg+xml;base64,${window.btoa(unescape(encodeURIComponent(svg)))}`;
 }
 
 function withTimeout(promise, ms, message) {
@@ -168,6 +231,10 @@ function App() {
   const generationSerialRef = useRef(0);
   const displayedGenerationRef = useRef(0);
   const inFlightGenerationCountRef = useRef(0);
+  const overlaySideRef = useRef("right");
+  const lastOverlayMoveRef = useRef(0);
+  const lastHandMetaRef = useRef(0);
+  const lastContextFingerprintRef = useRef("");
 
   const { supported, listening, transcript, setTranscript, start, stop, voiceStatus, voiceError } = useRealtimeVoice();
   const [cameraOn, setCameraOn] = useState(false);
@@ -179,12 +246,21 @@ function App() {
   const [mode, setMode] = useState("diagram");
   const [status, setStatus] = useState("Ready");
   const [image, setImage] = useState(null);
+  const [instantPreview, setInstantPreview] = useState(null);
   const [pendingGenerations, setPendingGenerations] = useState(0);
   const [prompt, setPrompt] = useState("");
   const [error, setError] = useState("");
   const [diagnostics, setDiagnostics] = useState([]);
   const [visualAnalysis, setVisualAnalysis] = useState("");
   const [analysisStatus, setAnalysisStatus] = useState("waiting for camera");
+  const [visualHistory, setVisualHistory] = useState([]);
+  const [generationQueue, setGenerationQueue] = useState([]);
+  const [currentBrief, setCurrentBrief] = useState("");
+  const [visualLocked, setVisualLocked] = useState(false);
+  const [overlayHidden, setOverlayHidden] = useState(false);
+  const [overlayExpanded, setOverlayExpanded] = useState(false);
+  const [overlaySide, setOverlaySide] = useState("right");
+  const [handActivity, setHandActivity] = useState("waiting for hands");
 
   const logDiagnostic = useCallback((message) => {
     setDiagnostics((items) => [`${nowTime()} ${message}`, ...items].slice(0, 6));
@@ -196,8 +272,21 @@ function App() {
       gestures: gestureEvents,
       strokes,
       mode,
-      visualAnalysis
+      visualAnalysis,
+      previousBrief: currentBrief,
+      visualHistory: visualHistory.slice(0, 3).map(({ brief, time, mode: visualMode }) => ({ brief, time, mode: visualMode }))
     }),
+    [currentBrief, gestureEvents, mode, strokes, transcript, visualAnalysis, visualHistory]
+  );
+
+  const contextFingerprint = useMemo(
+    () => [
+      transcript.slice(-240),
+      visualAnalysis.slice(-220),
+      gestureEvents.slice(-3).map((item) => item.label).join(","),
+      strokes.slice(-3).map((stroke) => `${stroke.hand || "hand"}:${stroke.direction}`).join(","),
+      mode
+    ].join("|"),
     [gestureEvents, mode, strokes, transcript, visualAnalysis]
   );
 
@@ -223,7 +312,12 @@ function App() {
     setImage(nextImage);
   }, []);
 
-  const generateImage = useCallback(async () => {
+  const generateImage = useCallback(async ({ force = true, reason = "manual" } = {}) => {
+    if (visualLocked && !force) {
+      setStatus("Visual locked");
+      return;
+    }
+
     if (inFlightGenerationCountRef.current >= MAX_PARALLEL_GENERATIONS) {
       setStatus(`Already generating ${MAX_PARALLEL_GENERATIONS} visuals`);
       return;
@@ -234,18 +328,29 @@ function App() {
     inFlightGenerationCountRef.current += 1;
     setPendingGenerations(inFlightGenerationCountRef.current);
     setError("");
-    setStatus(imageRef.current ? `Updating in background (${inFlightGenerationCountRef.current})` : "Generating first visual...");
     lastGenerationRef.current = Date.now();
 
+    const liveStrokes = summarizeLiveStrokes(strokeRef.current);
+    const requestContext = {
+      ...latestContext,
+      strokes: [...latestContext.strokes, ...liveStrokes].slice(-MAX_STROKES)
+    };
+    const brief = buildVisualBrief(requestContext);
+    const preview = makeInstantPreview({ ...requestContext, generationId });
+
+    setCurrentBrief(brief);
+    setInstantPreview(preview);
+    setGenerationQueue((items) => [
+      { id: generationId, reason, brief, time: nowTime(), status: "running" },
+      ...items
+    ].slice(0, 4));
+    setStatus(imageRef.current ? `Updating in background (${inFlightGenerationCountRef.current})` : "Instant sketch ready, generating polished visual...");
+
     try {
-      const liveStrokes = summarizeLiveStrokes(strokeRef.current);
       const response = await fetch("/api/generate", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          ...latestContext,
-          strokes: [...latestContext.strokes, ...liveStrokes].slice(-MAX_STROKES)
-        })
+        body: JSON.stringify(requestContext)
       });
       const payload = await response.json();
       if (!response.ok) throw new Error(payload.error || "Generation failed.");
@@ -254,19 +359,32 @@ function App() {
       if (shouldReplaceImage) {
         displayedGenerationRef.current = generationId;
         updateImage(payload.imageUrl);
+        setVisualHistory((items) => [
+          {
+            id: generationId,
+            imageUrl: payload.imageUrl,
+            brief,
+            mode,
+            time: nowTime(),
+            fallback: Boolean(payload.fallback)
+          },
+          ...items
+        ].slice(0, MAX_VISUAL_HISTORY));
       }
 
       setPrompt(payload.prompt);
       setError(payload.fallback ? payload.error || "Using demo fallback until OpenAI generation is available." : "");
       setStatus(payload.fallback && imageRef.current ? `Kept last visual ${nowTime()}` : `${payload.fallback ? "Demo fallback" : "Updated"} ${nowTime()}`);
+      setGenerationQueue((items) => items.map((item) => item.id === generationId ? { ...item, status: payload.fallback ? "fallback" : "complete" } : item));
     } catch (generationError) {
       setError(generationError instanceof Error ? generationError.message : "Generation failed.");
       setStatus(imageRef.current ? `Kept last visual ${nowTime()}` : "Generation paused");
+      setGenerationQueue((items) => items.map((item) => item.id === generationId ? { ...item, status: "error" } : item));
     } finally {
       inFlightGenerationCountRef.current = Math.max(0, inFlightGenerationCountRef.current - 1);
       setPendingGenerations(inFlightGenerationCountRef.current);
     }
-  }, [latestContext, updateImage]);
+  }, [latestContext, mode, updateImage, visualLocked]);
 
   const captureFrame = useCallback(() => {
     const canvas = canvasRef.current;
@@ -308,7 +426,7 @@ function App() {
       setVisualAnalysis(payload.analysis || "");
       setAnalysisStatus(`updated ${nowTime()}`);
       if (autoGenerate && Date.now() - lastGenerationRef.current > 2500) {
-        generateImage();
+        generateImage({ force: false, reason: "vision update" });
       }
     } catch (analysisError) {
       setAnalysisStatus("analysis error");
@@ -415,6 +533,23 @@ function App() {
         const topGesture = result?.gestures?.[0]?.[0];
         addGesture(topGesture?.categoryName, topGesture?.score);
 
+        const activeTips = landmarks.map((hand) => hand?.[8]).filter(Boolean);
+        if (activeTips.length) {
+          const timestamp = Date.now();
+          const averageX = activeTips.reduce((sum, point) => sum + point.x, 0) / activeTips.length;
+          const nextSide = averageX > 0.58 ? "left" : averageX < 0.42 ? "right" : overlaySideRef.current;
+          if (nextSide !== overlaySideRef.current && timestamp - lastOverlayMoveRef.current > 1400) {
+            overlaySideRef.current = nextSide;
+            lastOverlayMoveRef.current = timestamp;
+            setOverlaySide(nextSide);
+          }
+
+          if (timestamp - lastHandMetaRef.current > 650) {
+            lastHandMetaRef.current = timestamp;
+            setHandActivity(`${activeTips.length} hand${activeTips.length > 1 ? "s" : ""} active | overlay ${overlaySideRef.current}`);
+          }
+        }
+
         if (isDrawing) {
           strokeRef.current = strokeRef.current.map((points, handIndex) => {
             const indexFinger = landmarks[handIndex]?.[8];
@@ -450,16 +585,18 @@ function App() {
   }, [addGesture, cameraOn, isDrawing]);
 
   useEffect(() => {
-    if (!autoGenerate) return;
+    if (!autoGenerate || visualLocked) return;
     const timer = window.setInterval(() => {
       const hasContext = transcript.trim().length > 12 || gestureEvents.length > 0 || strokes.length > 0 || visualAnalysis.trim().length > 0;
-      if (hasContext && Date.now() - lastGenerationRef.current > AUTO_INTERVAL_MS - 1000) {
-        generateImage();
+      const contextChanged = contextFingerprint !== lastContextFingerprintRef.current;
+      if (hasContext && contextChanged && Date.now() - lastGenerationRef.current > AUTO_INTERVAL_MS - 1000) {
+        lastContextFingerprintRef.current = contextFingerprint;
+        generateImage({ force: false, reason: "context changed" });
       }
     }, 2000);
 
     return () => window.clearInterval(timer);
-  }, [autoGenerate, generateImage, gestureEvents.length, strokes.length, transcript, visualAnalysis]);
+  }, [autoGenerate, contextFingerprint, generateImage, gestureEvents.length, strokes.length, transcript, visualAnalysis, visualLocked]);
 
   useEffect(() => {
     if (!cameraOn || !autoGenerate) return;
@@ -491,16 +628,23 @@ function App() {
     setPrompt("");
     setError("");
     setVisualAnalysis("");
+    setInstantPreview(null);
+    setCurrentBrief("");
+    setGenerationQueue([]);
+    setVisualLocked(false);
     setAnalysisStatus(cameraOn ? "waiting for frame" : "waiting for camera");
   };
+
+  const visualSource = image || instantPreview;
+  const visualLabel = image ? "Generated teaching aid" : "Instant teaching sketch";
 
   return (
     <main className="app-shell">
       <section className="lecture-stage">
         <header className="topbar lecture-topbar">
           <div>
-            <h1>Teaching Image Assist</h1>
-            <p>Realtime gesture context to generated visual overlay</p>
+            <h1>Teaching Image Assist V2</h1>
+            <p>Live lesson copilot with adaptive visual memory</p>
           </div>
           <div className={`status-light ${cameraOn ? "live" : ""}`}>
             <span />
@@ -513,23 +657,47 @@ function App() {
           <canvas ref={canvasRef} />
           {!cameraOn && <div className="camera-empty">Camera preview appears here</div>}
 
-          <section className={`visual-stage ${pendingGenerations ? "is-generating" : ""}`}>
-            <div className="visual-header">
-              <div>
-                <h2>Generated visual aid</h2>
-                <p>{status}</p>
-              </div>
-              <button className="primary" onClick={generateImage} disabled={pendingGenerations >= MAX_PARALLEL_GENERATIONS}>Generate now</button>
-            </div>
-            <div className="generated-frame">
-              {image ? <img src={image} alt="Generated teaching aid" /> : <div className="image-placeholder">Waiting for the first visual</div>}
-              {pendingGenerations > 0 && (
-                <div className="generation-badge">
-                  {image ? `Updating ${pendingGenerations}` : "Generating"}
+          {!overlayHidden && (
+            <section className={`visual-stage side-${overlaySide} ${overlayExpanded ? "expanded" : ""} ${pendingGenerations ? "is-generating" : ""}`}>
+              <div className="visual-header">
+                <div>
+                  <h2>Generated visual aid</h2>
+                  <p>{status}</p>
                 </div>
-              )}
-            </div>
-          </section>
+                <div className="visual-actions">
+                  <button onClick={() => setVisualLocked((value) => !value)}>{visualLocked ? "Unlock" : "Lock"}</button>
+                  <button onClick={() => setOverlayExpanded((value) => !value)}>{overlayExpanded ? "Fit" : "Wide"}</button>
+                  <button className="primary" onClick={generateImage} disabled={pendingGenerations >= MAX_PARALLEL_GENERATIONS}>Generate</button>
+                </div>
+              </div>
+              <div className="generated-frame">
+                {visualSource ? <img src={visualSource} alt={visualLabel} /> : <div className="image-placeholder">Waiting for the first visual</div>}
+                {pendingGenerations > 0 && (
+                  <div className="generation-badge">
+                    {image ? `Updating ${pendingGenerations}` : "Instant preview"}
+                  </div>
+                )}
+              </div>
+              <div className="visual-intel">
+                <div>
+                  <span>Lesson memory</span>
+                  <strong>{currentBrief || "Listening for the next teaching unit"}</strong>
+                </div>
+                <div>
+                  <span>Placement</span>
+                  <strong>{handActivity}</strong>
+                </div>
+              </div>
+              <div className="visual-history">
+                {visualHistory.length ? visualHistory.map((item) => (
+                  <button key={item.id} className="history-thumb" onClick={() => updateImage(item.imageUrl)} title={item.brief}>
+                    <img src={item.imageUrl} alt={`Visual from ${item.time}`} />
+                    <span>{item.time}</span>
+                  </button>
+                )) : <span>No saved visual frames yet</span>}
+              </div>
+            </section>
+          )}
 
           <div className="floating-context">
             <div className="panel analysis-panel">
@@ -574,6 +742,7 @@ function App() {
             </div>
             <button onClick={() => setIsDrawing((value) => !value)}>{isDrawing ? "Pause trace" : "Resume trace"}</button>
             <button onClick={commitStroke}>Commit trace</button>
+            <button onClick={() => setOverlayHidden((value) => !value)}>{overlayHidden ? "Show visual" : "Hide visual"}</button>
             <button onClick={clearContext}>Clear</button>
           </div>
         </div>
@@ -603,6 +772,13 @@ function App() {
               )) : <li className="muted">Commit a trace to store it</li>}
             </ul>
           </div>
+        </div>
+
+        <div className="panel prompt-panel">
+          <div className="panel-header">
+            <h2>Generation queue</h2>
+          </div>
+          <pre>{generationQueue.length ? generationQueue.map((item) => `${item.time} #${item.id} ${item.status} ${item.reason}: ${item.brief}`).join("\n") : "Parallel visual updates will appear here."}</pre>
         </div>
 
         <div className="panel prompt-panel">
