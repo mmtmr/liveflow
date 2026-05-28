@@ -7,10 +7,40 @@ const MAX_PARALLEL_GENERATIONS = 3;
 const MAX_EVENTS = 10;
 const MAX_STROKES = 8;
 const MAX_VISUAL_HISTORY = 5;
+const RECENT_TRANSCRIPT_WORDS = 90;
+const HAND_TRIGGER_COOLDOWN_MS = 4800;
 const HAND_TRACE_COLORS = ["#ffcf5a", "#61dafb"];
+const OPEN_HAND_LABELS = new Set(["open_palm", "open palm"]);
+
+const MERMAID_CONFIG = {
+  startOnLoad: false,
+  securityLevel: "strict",
+  theme: "base",
+  flowchart: {
+    htmlLabels: false,
+    useMaxWidth: true
+  },
+  themeVariables: {
+    background: "#f6f0dc",
+    primaryColor: "#f6f0dc",
+    primaryTextColor: "#172129",
+    primaryBorderColor: "#2f7190",
+    lineColor: "#31414a",
+    secondaryColor: "#e8f1ee",
+    tertiaryColor: "#f7df9c",
+    fontFamily: "Inter, Arial, sans-serif"
+  }
+};
+
+let mermaidRuntime = null;
 
 function nowTime() {
   return new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" });
+}
+
+function formatLatency(ms) {
+  if (!Number.isFinite(ms)) return "waiting";
+  return ms < 1000 ? `${Math.round(ms)} ms` : `${(ms / 1000).toFixed(2)} s`;
 }
 
 function summarizeStroke(points, handLabel) {
@@ -37,6 +67,42 @@ function shortText(value, fallback = "Live lesson context", limit = 92) {
   return text.length > limit ? `${text.slice(0, limit - 1)}...` : text;
 }
 
+function recentWords(value, limit = RECENT_TRANSCRIPT_WORDS) {
+  const words = String(value || "").replace(/\s+/g, " ").trim().split(" ").filter(Boolean);
+  return words.slice(-limit).join(" ");
+}
+
+function isOpenHandGesture(label) {
+  return OPEN_HAND_LABELS.has(String(label || "").toLowerCase().replace(/-/g, "_"));
+}
+
+function captureCanvasFrame(canvas, maxWidth = 640, quality = 0.72) {
+  if (!canvas || !canvas.width || !canvas.height) return null;
+
+  const scale = Math.min(1, maxWidth / canvas.width);
+  const preview = document.createElement("canvas");
+  preview.width = Math.max(1, Math.round(canvas.width * scale));
+  preview.height = Math.max(1, Math.round(canvas.height * scale));
+  const ctx = preview.getContext("2d");
+  ctx.drawImage(canvas, 0, 0, preview.width, preview.height);
+  return preview.toDataURL("image/jpeg", quality);
+}
+
+async function renderMermaidImage(code, generationId) {
+  if (!mermaidRuntime) {
+    await import("mermaid/dist/mermaid.js");
+    mermaidRuntime = globalThis.mermaid;
+    if (!mermaidRuntime) {
+      throw new Error("Mermaid renderer did not load.");
+    }
+    mermaidRuntime.initialize(MERMAID_CONFIG);
+  }
+
+  const renderId = `mermaid-${generationId}-${Date.now()}`;
+  const { svg } = await mermaidRuntime.render(renderId, code);
+  return `data:image/svg+xml;charset=utf-8,${encodeURIComponent(svg)}`;
+}
+
 function escapeSvgText(value) {
   return String(value || "")
     .replace(/&/g, "&amp;")
@@ -45,12 +111,12 @@ function escapeSvgText(value) {
     .replace(/"/g, "&quot;");
 }
 
-function buildVisualBrief({ transcript, gestures, strokes, mode, visualAnalysis }) {
+function buildVisualBrief({ transcript, recentTranscript, gestures, strokes, mode, visualAnalysis }) {
   const latestGesture = gestures?.at?.(-1)?.label;
   const latestStroke = strokes?.at?.(-1);
   const parts = [
     mode ? `${mode} visual` : "diagram visual",
-    transcript ? shortText(transcript, "", 118) : "",
+    recentTranscript || transcript ? shortText(recentTranscript || transcript, "", 118) : "",
     visualAnalysis ? shortText(visualAnalysis, "", 118) : "",
     latestGesture ? `gesture: ${latestGesture}` : "",
     latestStroke ? `trace: ${latestStroke.hand || "hand"} ${latestStroke.direction}` : ""
@@ -59,9 +125,9 @@ function buildVisualBrief({ transcript, gestures, strokes, mode, visualAnalysis 
   return parts.join(" | ") || "Build a clear visual cue for the current live lesson.";
 }
 
-function makeInstantPreview({ transcript, gestures, strokes, mode, visualAnalysis, generationId }) {
+function makeInstantPreview({ transcript, recentTranscript, gestures, strokes, mode, visualAnalysis, generationId }) {
   const title = mode === "steps" ? "Next teaching step" : mode === "metaphor" ? "Live visual metaphor" : "Live diagram sketch";
-  const topic = shortText(transcript || visualAnalysis, "Listening for lesson context", 72);
+  const topic = shortText(recentTranscript || transcript || visualAnalysis, "Listening for lesson context", 72);
   const cue = shortText(visualAnalysis, gestures?.at?.(-1)?.label || "Watching hands and board", 86);
   const trace = strokes?.at?.(-1)?.direction || "trace will shape the next image";
   const accent = mode === "metaphor" ? "#78d6a3" : mode === "steps" ? "#61dafb" : "#f1c45a";
@@ -235,6 +301,8 @@ function App() {
   const lastOverlayMoveRef = useRef(0);
   const lastHandMetaRef = useRef(0);
   const lastContextFingerprintRef = useRef("");
+  const lastHandTriggerRef = useRef(0);
+  const handTriggerArmedRef = useRef(true);
 
   const { supported, listening, transcript, setTranscript, start, stop, voiceStatus, voiceError } = useRealtimeVoice();
   const [cameraOn, setCameraOn] = useState(false);
@@ -243,6 +311,8 @@ function App() {
   const [strokes, setStrokes] = useState([]);
   const [isDrawing, setIsDrawing] = useState(true);
   const [autoGenerate, setAutoGenerate] = useState(true);
+  const [generationTriggerMode, setGenerationTriggerMode] = useState("continuous");
+  const [imageProvider, setImageProvider] = useState("fal");
   const [mode, setMode] = useState("diagram");
   const [status, setStatus] = useState("Ready");
   const [image, setImage] = useState(null);
@@ -255,6 +325,7 @@ function App() {
   const [analysisStatus, setAnalysisStatus] = useState("waiting for camera");
   const [visualHistory, setVisualHistory] = useState([]);
   const [generationQueue, setGenerationQueue] = useState([]);
+  const [generationMetrics, setGenerationMetrics] = useState(null);
   const [currentBrief, setCurrentBrief] = useState("");
   const [visualLocked, setVisualLocked] = useState(false);
   const [overlayHidden, setOverlayHidden] = useState(false);
@@ -269,14 +340,16 @@ function App() {
   const latestContext = useMemo(
     () => ({
       transcript,
+      recentTranscript: recentWords(transcript),
       gestures: gestureEvents,
       strokes,
       mode,
+      imageProvider,
       visualAnalysis,
       previousBrief: currentBrief,
       visualHistory: visualHistory.slice(0, 3).map(({ brief, time, mode: visualMode }) => ({ brief, time, mode: visualMode }))
     }),
-    [currentBrief, gestureEvents, mode, strokes, transcript, visualAnalysis, visualHistory]
+    [currentBrief, gestureEvents, imageProvider, mode, strokes, transcript, visualAnalysis, visualHistory]
   );
 
   const contextFingerprint = useMemo(
@@ -307,6 +380,13 @@ function App() {
     });
   }, []);
 
+  const setTriggerMode = useCallback((nextMode) => {
+    handTriggerArmedRef.current = true;
+    lastHandTriggerRef.current = 0;
+    setGenerationTriggerMode(nextMode);
+    setStatus(nextMode === "hands" ? "Show two open hands to generate" : "Continuous generation ready");
+  }, []);
+
   const updateImage = useCallback((nextImage) => {
     imageRef.current = nextImage;
     setImage(nextImage);
@@ -333,7 +413,8 @@ function App() {
     const liveStrokes = summarizeLiveStrokes(strokeRef.current);
     const requestContext = {
       ...latestContext,
-      strokes: [...latestContext.strokes, ...liveStrokes].slice(-MAX_STROKES)
+      strokes: [...latestContext.strokes, ...liveStrokes].slice(-MAX_STROKES),
+      frame: captureCanvasFrame(canvasRef.current, 560, 0.68)
     };
     const brief = buildVisualBrief(requestContext);
     const preview = makeInstantPreview({ ...requestContext, generationId });
@@ -354,28 +435,52 @@ function App() {
       });
       const payload = await response.json();
       if (!response.ok) throw new Error(payload.error || "Generation failed.");
+      const nextImageUrl = payload.diagramType === "mermaid"
+        ? await renderMermaidImage(payload.mermaidCode, generationId)
+        : payload.imageUrl;
 
-      const shouldReplaceImage = generationId > displayedGenerationRef.current && (!payload.fallback || !imageRef.current);
+      const shouldReplaceImage = generationId > displayedGenerationRef.current && nextImageUrl && (!payload.fallback || !imageRef.current);
       if (shouldReplaceImage) {
         displayedGenerationRef.current = generationId;
-        updateImage(payload.imageUrl);
+        updateImage(nextImageUrl);
         setVisualHistory((items) => [
           {
             id: generationId,
-            imageUrl: payload.imageUrl,
+            imageUrl: nextImageUrl,
             brief,
             mode,
             time: nowTime(),
-            fallback: Boolean(payload.fallback)
+            fallback: Boolean(payload.fallback),
+            diagramType: payload.diagramType,
+            mermaidCode: payload.mermaidCode
           },
           ...items
         ].slice(0, MAX_VISUAL_HISTORY));
       }
 
       setPrompt(payload.prompt);
-      setError(payload.fallback ? payload.error || "Using demo fallback until OpenAI generation is available." : "");
-      setStatus(payload.fallback && imageRef.current ? `Kept last visual ${nowTime()}` : `${payload.fallback ? "Demo fallback" : "Updated"} ${nowTime()}`);
-      setGenerationQueue((items) => items.map((item) => item.id === generationId ? { ...item, status: payload.fallback ? "fallback" : "complete" } : item));
+      setGenerationMetrics({
+        provider: payload.provider || "image provider",
+        model: payload.model || "unknown model",
+        durationMs: payload.durationMs,
+        contextDurationMs: payload.contextDurationMs,
+        timings: payload.timings
+      });
+      if (payload.generationAnalysis) {
+        setVisualAnalysis(payload.generationAnalysis);
+      }
+      setError(payload.fallback ? payload.error || "Using demo fallback until image generation is available." : "");
+      const contextSuffix = payload.contextDurationMs ? `, context ${formatLatency(payload.contextDurationMs)}` : "";
+      setStatus(payload.fallback && imageRef.current
+        ? `Kept last visual after ${formatLatency(payload.durationMs)}${contextSuffix} ${nowTime()}`
+        : `${payload.fallback ? "Demo fallback" : "Updated"} in ${formatLatency(payload.durationMs)}${contextSuffix} ${nowTime()}`);
+      setGenerationQueue((items) => items.map((item) => item.id === generationId ? {
+        ...item,
+        status: payload.fallback ? "fallback" : "complete",
+        latency: formatLatency(payload.durationMs),
+        provider: payload.provider,
+        model: payload.model
+      } : item));
     } catch (generationError) {
       setError(generationError instanceof Error ? generationError.message : "Generation failed.");
       setStatus(imageRef.current ? `Kept last visual ${nowTime()}` : "Generation paused");
@@ -387,17 +492,7 @@ function App() {
   }, [latestContext, mode, updateImage, visualLocked]);
 
   const captureFrame = useCallback(() => {
-    const canvas = canvasRef.current;
-    if (!canvas || !canvas.width || !canvas.height) return null;
-
-    const maxWidth = 640;
-    const scale = Math.min(1, maxWidth / canvas.width);
-    const preview = document.createElement("canvas");
-    preview.width = Math.max(1, Math.round(canvas.width * scale));
-    preview.height = Math.max(1, Math.round(canvas.height * scale));
-    const ctx = preview.getContext("2d");
-    ctx.drawImage(canvas, 0, 0, preview.width, preview.height);
-    return preview.toDataURL("image/jpeg", 0.72);
+    return captureCanvasFrame(canvasRef.current);
   }, []);
 
   const analyzeCurrentFrame = useCallback(async () => {
@@ -417,6 +512,7 @@ function App() {
         body: JSON.stringify({
           frame,
           transcript,
+          recentTranscript: recentWords(transcript),
           gestures: gestureEvents,
           strokes: [...strokes, ...liveStrokes].slice(-MAX_STROKES)
         })
@@ -425,7 +521,7 @@ function App() {
       if (!response.ok) throw new Error(payload.error || "Frame analysis failed.");
       setVisualAnalysis(payload.analysis || "");
       setAnalysisStatus(`updated ${nowTime()}`);
-      if (autoGenerate && Date.now() - lastGenerationRef.current > 2500) {
+      if (autoGenerate && generationTriggerMode === "continuous" && Date.now() - lastGenerationRef.current > 2500) {
         generateImage({ force: false, reason: "vision update" });
       }
     } catch (analysisError) {
@@ -434,7 +530,7 @@ function App() {
     } finally {
       analyzingRef.current = false;
     }
-  }, [autoGenerate, cameraOn, captureFrame, generateImage, gestureEvents, strokes, transcript]);
+  }, [autoGenerate, cameraOn, captureFrame, generateImage, generationTriggerMode, gestureEvents, strokes, transcript]);
 
   const startCamera = useCallback(async () => {
     setError("");
@@ -500,6 +596,22 @@ function App() {
     setTrackingState("idle");
   }, []);
 
+  const startLiveSession = useCallback(async () => {
+    setError("");
+    setStatus("Starting camera and realtime...");
+    await Promise.all([
+      startCamera(),
+      supported && !listening ? start() : Promise.resolve()
+    ]);
+    setStatus("Live session running");
+  }, [listening, start, startCamera, supported]);
+
+  const stopLiveSession = useCallback(() => {
+    stopCamera();
+    stop();
+    setStatus("Live session stopped");
+  }, [stop, stopCamera]);
+
   useEffect(() => {
     if (!cameraOn) return;
 
@@ -530,14 +642,18 @@ function App() {
           });
         });
 
-        const topGesture = result?.gestures?.[0]?.[0];
-        addGesture(topGesture?.categoryName, topGesture?.score);
+        const topGestures = (result?.gestures || [])
+          .map((handGestures) => handGestures?.[0])
+          .filter(Boolean);
+        topGestures.forEach((gesture) => addGesture(gesture.categoryName, gesture.score));
+        const openHandCount = topGestures.filter((gesture) => isOpenHandGesture(gesture.categoryName)).length;
 
         const activeTips = landmarks.map((hand) => hand?.[8]).filter(Boolean);
         if (activeTips.length) {
           const timestamp = Date.now();
           const averageX = activeTips.reduce((sum, point) => sum + point.x, 0) / activeTips.length;
-          const nextSide = averageX > 0.58 ? "left" : averageX < 0.42 ? "right" : overlaySideRef.current;
+          const displayedAverageX = 1 - averageX;
+          const nextSide = displayedAverageX > 0.58 ? "left" : displayedAverageX < 0.42 ? "right" : overlaySideRef.current;
           if (nextSide !== overlaySideRef.current && timestamp - lastOverlayMoveRef.current > 1400) {
             overlaySideRef.current = nextSide;
             lastOverlayMoveRef.current = timestamp;
@@ -546,8 +662,29 @@ function App() {
 
           if (timestamp - lastHandMetaRef.current > 650) {
             lastHandMetaRef.current = timestamp;
-            setHandActivity(`${activeTips.length} hand${activeTips.length > 1 ? "s" : ""} active | overlay ${overlaySideRef.current}`);
+            const triggerCue = generationTriggerMode === "hands"
+              ? ` | ${openHandCount}/2 open`
+              : "";
+            setHandActivity(`${activeTips.length} hand${activeTips.length > 1 ? "s" : ""} active${triggerCue} | overlay ${overlaySideRef.current}`);
           }
+        }
+
+        const twoOpenHands = openHandCount >= 2;
+        if (!twoOpenHands) {
+          handTriggerArmedRef.current = true;
+        }
+        if (
+          twoOpenHands &&
+          handTriggerArmedRef.current &&
+          autoGenerate &&
+          generationTriggerMode === "hands" &&
+          !visualLocked &&
+          inFlightGenerationCountRef.current < MAX_PARALLEL_GENERATIONS &&
+          Date.now() - lastHandTriggerRef.current > HAND_TRIGGER_COOLDOWN_MS
+        ) {
+          handTriggerArmedRef.current = false;
+          lastHandTriggerRef.current = Date.now();
+          generateImage({ force: false, reason: "two open hands" });
         }
 
         if (isDrawing) {
@@ -582,10 +719,10 @@ function App() {
 
     rafRef.current = requestAnimationFrame(drawFrame);
     return () => cancelAnimationFrame(rafRef.current);
-  }, [addGesture, cameraOn, isDrawing]);
+  }, [addGesture, autoGenerate, cameraOn, generateImage, generationTriggerMode, isDrawing, visualLocked]);
 
   useEffect(() => {
-    if (!autoGenerate || visualLocked) return;
+    if (!autoGenerate || visualLocked || generationTriggerMode !== "continuous") return;
     const timer = window.setInterval(() => {
       const hasContext = transcript.trim().length > 12 || gestureEvents.length > 0 || strokes.length > 0 || visualAnalysis.trim().length > 0;
       const contextChanged = contextFingerprint !== lastContextFingerprintRef.current;
@@ -596,7 +733,7 @@ function App() {
     }, 2000);
 
     return () => window.clearInterval(timer);
-  }, [autoGenerate, contextFingerprint, generateImage, gestureEvents.length, strokes.length, transcript, visualAnalysis, visualLocked]);
+  }, [autoGenerate, contextFingerprint, generateImage, generationTriggerMode, gestureEvents.length, strokes.length, transcript, visualAnalysis, visualLocked]);
 
   useEffect(() => {
     if (!cameraOn || !autoGenerate) return;
@@ -687,6 +824,10 @@ function App() {
                   <span>Placement</span>
                   <strong>{handActivity}</strong>
                 </div>
+                <div>
+                  <span>Latency</span>
+                  <strong>{generationMetrics ? `${formatLatency(generationMetrics.durationMs)}${generationMetrics.contextDurationMs ? `, context ${formatLatency(generationMetrics.contextDurationMs)}` : ""} - ${generationMetrics.model}` : "waiting for first run"}</strong>
+                </div>
               </div>
               <div className="visual-history">
                 {visualHistory.length ? visualHistory.map((item) => (
@@ -705,7 +846,7 @@ function App() {
                 <h2>Camera vision analysis</h2>
                 <span>{analysisStatus}</span>
               </div>
-              <pre>{visualAnalysis || "Start camera with Auto on to analyze the live frame, board, hands, and traces."}</pre>
+              <pre>{visualAnalysis || "Start live with Auto on to analyze the live frame, board, hands, and traces."}</pre>
             </div>
 
             <div className="panel transcript-panel">
@@ -716,7 +857,7 @@ function App() {
               <textarea
                 value={transcript}
                 onChange={(event) => setTranscript(event.target.value)}
-                placeholder="Start realtime, or type lesson context here..."
+                placeholder="Start live, or type lesson context here..."
               />
               {voiceError && <div className="inline-error">{voiceError}</div>}
             </div>
@@ -725,14 +866,34 @@ function App() {
           {error && <div className="error-banner">{error}</div>}
 
           <div className="lecture-controls">
-            <button onClick={cameraOn ? stopCamera : startCamera}>{cameraOn ? "Stop camera" : "Start camera"}</button>
-            <button onClick={listening ? stop : start} disabled={!supported}>
-              {listening ? "Stop realtime" : "Start realtime"}
+            <button onClick={cameraOn || listening ? stopLiveSession : startLiveSession}>
+              {cameraOn || listening ? "Stop live" : "Start live"}
             </button>
             <label className="switch">
               <input type="checkbox" checked={autoGenerate} onChange={(event) => setAutoGenerate(event.target.checked)} />
               <span>Auto</span>
             </label>
+            <div className="segmented trigger-mode">
+              {[
+                ["continuous", "Continuous"],
+                ["hands", "2 hands"]
+              ].map(([value, label]) => (
+                <button key={value} className={generationTriggerMode === value ? "selected" : ""} onClick={() => setTriggerMode(value)}>
+                  {label}
+                </button>
+              ))}
+            </div>
+            <div className="segmented provider-mode">
+              {[
+                ["fal", "Flux"],
+                ["openai", "GPT Image 2"],
+                ["mermaid", "Mermaid"]
+              ].map(([value, label]) => (
+                <button key={value} className={imageProvider === value ? "selected" : ""} onClick={() => setImageProvider(value)}>
+                  {label}
+                </button>
+              ))}
+            </div>
             <div className="segmented compact">
               {["diagram", "metaphor", "steps"].map((item) => (
                 <button key={item} className={mode === item ? "selected" : ""} onClick={() => setMode(item)}>
@@ -778,7 +939,7 @@ function App() {
           <div className="panel-header">
             <h2>Generation queue</h2>
           </div>
-          <pre>{generationQueue.length ? generationQueue.map((item) => `${item.time} #${item.id} ${item.status} ${item.reason}: ${item.brief}`).join("\n") : "Parallel visual updates will appear here."}</pre>
+          <pre>{generationQueue.length ? generationQueue.map((item) => `${item.time} #${item.id} ${item.status}${item.latency ? ` ${item.latency}` : ""} ${item.reason}: ${item.brief}`).join("\n") : "Parallel visual updates will appear here."}</pre>
         </div>
 
         <div className="panel prompt-panel">
@@ -793,7 +954,7 @@ function App() {
             <h2>Camera diagnostics</h2>
             <span>{window.isSecureContext ? "secure" : "not secure"}</span>
           </div>
-          <pre>{diagnostics.length ? diagnostics.join("\n") : "Click Start camera to run diagnostics."}</pre>
+          <pre>{diagnostics.length ? diagnostics.join("\n") : "Click Start live to run diagnostics."}</pre>
         </div>
       </aside>
     </main>

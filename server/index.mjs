@@ -6,6 +6,10 @@ config();
 
 const app = express();
 const port = Number(process.env.PORT || 8787);
+const falImageModel = process.env.FAL_IMAGE_MODEL || "fal-ai/flux/schnell";
+const falImageEndpoint = `https://fal.run/${falImageModel}`;
+const openAIImageModel = process.env.OPENAI_IMAGE_MODEL || "gpt-image-2";
+const mermaidModel = process.env.OPENAI_MERMAID_MODEL || process.env.OPENAI_VISION_MODEL || "gpt-4.1-mini";
 
 app.use(express.json({ limit: "2mb" }));
 
@@ -19,8 +23,8 @@ function extractResponseText(payload) {
     .trim();
 }
 
-function buildImagePrompt({ transcript, gestures, strokes, mode, visualAnalysis, previousBrief, visualHistory }) {
-  const speech = transcript?.trim() || "The teacher is explaining a concept.";
+function buildImagePrompt({ transcript, recentTranscript, gestures, strokes, mode, visualAnalysis, generationAnalysis, previousBrief, visualHistory }) {
+  const speech = recentTranscript?.trim() || transcript?.trim() || "The teacher is explaining a concept.";
   const gestureSummary = gestures?.length
     ? gestures.slice(-8).map((item) => `${item.label} (${item.score})`).join(", ")
     : "No clear gesture detected yet.";
@@ -34,6 +38,7 @@ function buildImagePrompt({ transcript, gestures, strokes, mode, visualAnalysis,
   const continuity = previousBrief?.trim()
     ? `Continue and refine the previous visual instead of restarting: ${previousBrief.trim()}`
     : "This may be the first visual. Establish a simple reusable diagram foundation.";
+  const freshSummary = generationAnalysis?.trim() || "No fresh generation snapshot analysis.";
   const historySummary = Array.isArray(visualHistory) && visualHistory.length
     ? visualHistory
         .slice(0, 3)
@@ -47,12 +52,15 @@ function buildImagePrompt({ transcript, gestures, strokes, mode, visualAnalysis,
     "Use a clean infographic, classroom diagram, or whiteboard visual that directly follows the current lesson.",
     "Preserve continuity: evolve the active idea, add the new concept, and avoid changing style or subject unless the lesson clearly moved on.",
     "If the teacher traced arrows, circles, comparisons, or paths, convert those gestures into semantic arrows, highlights, groupings, or process flow.",
+    "Use the fresh generation snapshot as the strongest signal for what the teacher is pointing at right now.",
+    "Use recent speech as the strongest signal for labels, topic, and intended teaching meaning.",
     "Prioritize the latest camera scene analysis over generic assumptions when choosing what to draw.",
     "Reflect the teacher's visible pointing, board content, objects, and traced hand paths when they are pedagogically meaningful.",
     "Do not include photorealistic people, clutter, tiny text, brand marks, watermarks, or UI chrome.",
     continuity,
     `Recent visual history: ${historySummary}`,
-    `Lesson context: ${speech}`,
+    `Recent speech context: ${speech}`,
+    `Fresh generation snapshot analysis: ${freshSummary}`,
     `Camera scene analysis: ${sceneSummary}`,
     `Detected gestures: ${gestureSummary}`,
     `Teacher traced lines: ${strokeSummary}`,
@@ -62,6 +70,363 @@ function buildImagePrompt({ transcript, gestures, strokes, mode, visualAnalysis,
 
 function sanitizeOpenAIError(message) {
   return String(message || "Image generation failed.").replace(/sk-[A-Za-z0-9_*.-]+/g, "[redacted-api-key]");
+}
+
+function sanitizeFalError(message) {
+  return String(message || "Image generation failed.")
+    .replace(/Key\s+[A-Za-z0-9_*.:/-]+/g, "Key [redacted-api-key]")
+    .replace(/fal_[A-Za-z0-9_*.-]+/g, "[redacted-api-key]");
+}
+
+function numberFromEnv(name, fallback) {
+  const value = Number(process.env[name]);
+  return Number.isFinite(value) ? value : fallback;
+}
+
+function getImageProvider(value) {
+  if (value === "openai" || value === "mermaid") return value;
+  return "fal";
+}
+
+function buildMermaidPrompt({ transcript, recentTranscript, gestures, strokes, mode, visualAnalysis, previousBrief, visualHistory }) {
+  const speech = recentTranscript?.trim() || transcript?.trim() || "The teacher is explaining a concept.";
+  const gestureSummary = gestures?.length
+    ? gestures.slice(-8).map((item) => `${item.label} (${item.score})`).join(", ")
+    : "No clear gesture detected.";
+  const strokeSummary = strokes?.length
+    ? strokes.slice(-6).map((stroke) => `${stroke.hand || "hand"} ${stroke.direction}, ${stroke.points} points`).join("; ")
+    : "No visible trace metadata.";
+  const historySummary = Array.isArray(visualHistory) && visualHistory.length
+    ? visualHistory.slice(0, 3).map((item) => item.brief || item.mode || "previous visual").join("; ")
+    : "No previous visual history.";
+
+  return [
+    "Create one Mermaid diagram for a live teaching overlay.",
+    "Return Mermaid syntax only. Do not use markdown fences, prose, HTML, emojis, comments, or unsupported styling.",
+    "Prefer flowchart TD for processes, cause/effect, comparisons, cycles, or concept maps. Use sequenceDiagram only for clear timelines/conversations.",
+    "Keep it readable in an overlay: 4 to 10 nodes, short labels, simple arrows, no dense paragraphs.",
+    "Use quoted node labels when labels contain punctuation.",
+    "If the teacher trace implies direction, connection, grouping, cycle, or comparison, encode that in the diagram arrows.",
+    "Recent speech is the strongest signal for topic and labels.",
+    `Visual mode: ${mode || "diagram"}`,
+    `Recent speech: ${speech}`,
+    `Camera analysis: ${visualAnalysis || "No camera analysis."}`,
+    `Gestures: ${gestureSummary}`,
+    `Traces: ${strokeSummary}`,
+    `Previous brief: ${previousBrief || "none"}`,
+    `Recent visual history: ${historySummary}`
+  ].join("\n");
+}
+
+function cleanMermaidCode(value) {
+  let code = String(value || "").trim();
+  code = code.replace(/^```(?:mermaid)?\s*/i, "").replace(/```$/i, "").trim();
+  code = code.replace(/^mermaid\s*/i, "").trim();
+  const validStart = /^(flowchart|graph|sequenceDiagram|classDiagram|stateDiagram-v2|journey|timeline|mindmap)\b/i;
+  if (validStart.test(code)) return code;
+
+  const fallbackLabel = code
+    .split(/\n+/)
+    .map((line) => line.replace(/["[\]{}()<>]/g, "").trim())
+    .filter(Boolean)
+    .slice(0, 4);
+  const nodes = fallbackLabel.length ? fallbackLabel : ["Lesson context", "Key idea", "Visual aid"];
+  return [
+    "flowchart TD",
+    ...nodes.map((label, index) => `  N${index + 1}["${label.slice(0, 72)}"]`),
+    ...nodes.slice(1).map((_label, index) => `  N${index + 1} --> N${index + 2}`)
+  ].join("\n");
+}
+
+async function analyzeGenerationFrame({ frame, transcript, recentTranscript, gestures, strokes }) {
+  if (!process.env.OPENAI_API_KEY || !frame || !String(frame).startsWith("data:image/")) {
+    return { analysis: "", durationMs: 0 };
+  }
+
+  const startedAt = Date.now();
+  const speech = recentTranscript || transcript || "";
+  const gestureSummary = gestures?.length
+    ? gestures.slice(-8).map((item) => `${item.label} (${item.score})`).join(", ")
+    : "No gesture labels.";
+  const strokeSummary = strokes?.length
+    ? strokes.slice(-6).map((stroke) => `${stroke.hand || "hand"} ${stroke.direction}, ${stroke.points} points`).join("; ")
+    : "No committed stroke metadata.";
+
+  try {
+    const response = await fetch("https://api.openai.com/v1/responses", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify({
+        model: process.env.OPENAI_VISION_MODEL || "gpt-4.1-mini",
+        input: [
+          {
+            role: "user",
+            content: [
+              {
+                type: "input_text",
+                text: [
+                  "Analyze this current teacher camera snapshot for text-to-image prompt grounding.",
+                  "The image may include colored hand-trace overlays drawn from index-finger movement.",
+                  "Return 4 concise, high-signal bullets only:",
+                  "1. Visible lesson topic, board/object content, or teaching materials.",
+                  "2. What the visible colored traces point to, circle, connect, compare, or move across.",
+                  "3. How the recent speech should change the visual aid.",
+                  "4. The exact visual aid to generate next, including layout and key labels.",
+                  `Recent speech: ${speech || "No recent speech."}`,
+                  `Gesture labels: ${gestureSummary}`,
+                  `Stroke metadata: ${strokeSummary}`
+                ].join("\n")
+              },
+              {
+                type: "input_image",
+                image_url: frame
+              }
+            ]
+          }
+        ]
+      })
+    });
+
+    const payload = await response.json();
+    if (!response.ok) return { analysis: "", durationMs: Date.now() - startedAt };
+
+    return {
+      analysis: extractResponseText(payload),
+      durationMs: Date.now() - startedAt
+    };
+  } catch {
+    return { analysis: "", durationMs: Date.now() - startedAt };
+  }
+}
+
+async function generateFalImage({ prompt, requestContext, generationFrame, startedAt }) {
+  const falKey = process.env.FAL_KEY || process.env.FAL_API_KEY;
+
+  if (!falKey) {
+    return {
+      imageUrl: makeFallbackImage(requestContext),
+      prompt,
+      fallback: true,
+      provider: "fal.ai",
+      model: falImageModel,
+      durationMs: Date.now() - startedAt,
+      contextDurationMs: generationFrame.durationMs,
+      generationAnalysis: generationFrame.analysis,
+      error: "FAL_KEY or FAL_API_KEY is not available to the server process.",
+      createdAt: new Date().toISOString()
+    };
+  }
+
+  const requestBody = {
+    prompt,
+    num_inference_steps: numberFromEnv("FAL_NUM_INFERENCE_STEPS", 4),
+    image_size: process.env.FAL_IMAGE_SIZE || "square_hd",
+    guidance_scale: numberFromEnv("FAL_GUIDANCE_SCALE", 3.5),
+    sync_mode: false,
+    num_images: 1,
+    enable_safety_checker: process.env.FAL_ENABLE_SAFETY_CHECKER !== "false",
+    output_format: process.env.FAL_OUTPUT_FORMAT || "jpeg",
+    acceleration: process.env.FAL_ACCELERATION || "high"
+  };
+
+  const response = await fetch(falImageEndpoint, {
+    method: "POST",
+    headers: {
+      Authorization: `Key ${falKey}`,
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify(requestBody)
+  });
+
+  const payload = await response.json();
+  const durationMs = Date.now() - startedAt;
+
+  if (!response.ok) {
+    return {
+      imageUrl: makeFallbackImage(requestContext),
+      prompt,
+      fallback: true,
+      provider: "fal.ai",
+      model: falImageModel,
+      durationMs,
+      contextDurationMs: generationFrame.durationMs,
+      generationAnalysis: generationFrame.analysis,
+      timings: payload.timings,
+      error: sanitizeFalError(payload.detail || payload.error?.message || payload.message),
+      details: payload.error?.type || response.statusText,
+      createdAt: new Date().toISOString()
+    };
+  }
+
+  const imageUrl = payload.images?.[0]?.url;
+  if (!imageUrl) {
+    throw new Error("fal.ai returned no image URL.");
+  }
+
+  return {
+    imageUrl,
+    prompt,
+    provider: "fal.ai",
+    model: falImageModel,
+    durationMs,
+    contextDurationMs: generationFrame.durationMs,
+    generationAnalysis: generationFrame.analysis,
+    timings: payload.timings,
+    seed: payload.seed,
+    nsfw: payload.has_nsfw_concepts?.[0] || false,
+    createdAt: new Date().toISOString()
+  };
+}
+
+async function generateOpenAIImage({ prompt, requestContext, generationFrame, startedAt }) {
+  if (!process.env.OPENAI_API_KEY) {
+    return {
+      imageUrl: makeFallbackImage(requestContext),
+      prompt,
+      fallback: true,
+      provider: "OpenAI",
+      model: openAIImageModel,
+      durationMs: Date.now() - startedAt,
+      contextDurationMs: generationFrame.durationMs,
+      generationAnalysis: generationFrame.analysis,
+      error: "OPENAI_API_KEY is not available to the server process.",
+      createdAt: new Date().toISOString()
+    };
+  }
+
+  const response = await fetch("https://api.openai.com/v1/images/generations", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify({
+      model: openAIImageModel,
+      prompt,
+      size: process.env.OPENAI_IMAGE_SIZE || "1024x1024",
+      quality: process.env.OPENAI_IMAGE_QUALITY || "low",
+      n: 1
+    })
+  });
+
+  const payload = await response.json();
+  const durationMs = Date.now() - startedAt;
+
+  if (!response.ok) {
+    return {
+      imageUrl: makeFallbackImage(requestContext),
+      prompt,
+      fallback: true,
+      provider: "OpenAI",
+      model: openAIImageModel,
+      durationMs,
+      contextDurationMs: generationFrame.durationMs,
+      generationAnalysis: generationFrame.analysis,
+      error: sanitizeOpenAIError(payload.error?.message),
+      details: payload.error?.type || response.statusText,
+      createdAt: new Date().toISOString()
+    };
+  }
+
+  const first = payload.data?.[0];
+  const imageUrl = first?.b64_json
+    ? `data:image/png;base64,${first.b64_json}`
+    : first?.url;
+
+  if (!imageUrl) {
+    throw new Error("OpenAI returned no image URL or base64 image data.");
+  }
+
+  return {
+    imageUrl,
+    prompt,
+    provider: "OpenAI",
+    model: openAIImageModel,
+    durationMs,
+    contextDurationMs: generationFrame.durationMs,
+    generationAnalysis: generationFrame.analysis,
+    usage: payload.usage,
+    createdAt: new Date().toISOString()
+  };
+}
+
+async function generateMermaidDiagram({ requestContext, generationFrame, startedAt }) {
+  const prompt = buildMermaidPrompt({
+    ...requestContext,
+    generationAnalysis: generationFrame.analysis
+  });
+
+  if (!process.env.OPENAI_API_KEY) {
+    return {
+      imageUrl: makeFallbackImage(requestContext),
+      prompt,
+      fallback: true,
+      provider: "Mermaid",
+      model: mermaidModel,
+      durationMs: Date.now() - startedAt,
+      contextDurationMs: generationFrame.durationMs,
+      generationAnalysis: generationFrame.analysis,
+      error: "OPENAI_API_KEY is not available to the server process.",
+      createdAt: new Date().toISOString()
+    };
+  }
+
+  const response = await fetch("https://api.openai.com/v1/responses", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify({
+      model: mermaidModel,
+      input: [
+        {
+          role: "user",
+          content: [
+            {
+              type: "input_text",
+              text: prompt
+            }
+          ]
+        }
+      ]
+    })
+  });
+
+  const payload = await response.json();
+  const durationMs = Date.now() - startedAt;
+
+  if (!response.ok) {
+    return {
+      imageUrl: makeFallbackImage(requestContext),
+      prompt,
+      fallback: true,
+      provider: "Mermaid",
+      model: mermaidModel,
+      durationMs,
+      contextDurationMs: generationFrame.durationMs,
+      generationAnalysis: generationFrame.analysis,
+      error: sanitizeOpenAIError(payload.error?.message),
+      details: payload.error?.type || response.statusText,
+      createdAt: new Date().toISOString()
+    };
+  }
+
+  const mermaidCode = cleanMermaidCode(extractResponseText(payload));
+  return {
+    diagramType: "mermaid",
+    mermaidCode,
+    prompt: mermaidCode,
+    provider: "Mermaid",
+    model: mermaidModel,
+    durationMs,
+    contextDurationMs: generationFrame.durationMs,
+    generationAnalysis: generationFrame.analysis,
+    createdAt: new Date().toISOString()
+  };
 }
 
 function escapeXml(value) {
@@ -106,7 +471,13 @@ function makeFallbackImage({ transcript, gestures, strokes, mode }) {
 app.get("/api/health", (_req, res) => {
   res.json({
     ok: true,
-    hasOpenAIKey: Boolean(process.env.OPENAI_API_KEY)
+    hasOpenAIKey: Boolean(process.env.OPENAI_API_KEY),
+    hasFalKey: Boolean(process.env.FAL_KEY || process.env.FAL_API_KEY),
+    imageProviders: {
+      fal: falImageModel,
+      openai: openAIImageModel,
+      mermaid: mermaidModel
+    }
   });
 });
 
@@ -244,65 +615,40 @@ app.post("/api/analyze-frame", async (req, res) => {
 });
 
 app.post("/api/generate", async (req, res) => {
-  if (!process.env.OPENAI_API_KEY) {
-    return res.status(500).json({
-      error: "OPENAI_API_KEY is not available to the server process."
-    });
-  }
+  const startedAt = Date.now();
+  const requestContext = req.body || {};
+  const imageProvider = getImageProvider(requestContext.imageProvider);
 
-  const prompt = buildImagePrompt(req.body || {});
+  const generationFrame = imageProvider === "openai" || requestContext.forceGenerationAnalysis
+    ? await analyzeGenerationFrame(requestContext)
+    : { analysis: "", durationMs: 0 };
+  const prompt = buildImagePrompt({
+    ...requestContext,
+    generationAnalysis: generationFrame.analysis
+  });
 
   try {
-    const response = await fetch("https://api.openai.com/v1/images/generations", {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
-        "Content-Type": "application/json"
-      },
-      body: JSON.stringify({
-        model: process.env.OPENAI_IMAGE_MODEL || "gpt-image-2",
-        prompt,
-        size: "1024x1024",
-        quality: "low",
-        n: 1
-      })
-    });
-
-    const payload = await response.json();
-
-    if (!response.ok) {
-      return res.status(200).json({
-        imageUrl: makeFallbackImage(req.body || {}),
-        prompt,
-        fallback: true,
-        error: sanitizeOpenAIError(payload.error?.message),
-        details: payload.error?.type || response.statusText,
-        createdAt: new Date().toISOString()
-      });
-    }
-
-    const first = payload.data?.[0];
-    const imageUrl = first?.b64_json
-      ? `data:image/png;base64,${first.b64_json}`
-      : first?.url;
-
-    if (!imageUrl) {
-      return res.status(502).json({
-        error: "OpenAI returned no image URL or base64 image data."
-      });
-    }
-
-    res.json({
-      imageUrl,
-      prompt,
-      createdAt: new Date().toISOString()
-    });
+    const result = imageProvider === "mermaid"
+      ? await generateMermaidDiagram({ requestContext, generationFrame, startedAt })
+      : imageProvider === "openai"
+        ? await generateOpenAIImage({ prompt, requestContext, generationFrame, startedAt })
+        : await generateFalImage({ prompt, requestContext, generationFrame, startedAt });
+    res.json(result);
   } catch (error) {
+    const providerLabel = imageProvider === "mermaid" ? "Mermaid" : imageProvider === "openai" ? "OpenAI" : "fal.ai";
+    const model = imageProvider === "mermaid" ? mermaidModel : imageProvider === "openai" ? openAIImageModel : falImageModel;
     res.status(200).json({
-      imageUrl: makeFallbackImage(req.body || {}),
+      imageUrl: makeFallbackImage(requestContext),
       prompt,
       fallback: true,
-      error: sanitizeOpenAIError(error instanceof Error ? error.message : "Unexpected server error."),
+      provider: providerLabel,
+      model,
+      durationMs: Date.now() - startedAt,
+      contextDurationMs: generationFrame.durationMs,
+      generationAnalysis: generationFrame.analysis,
+      error: imageProvider === "openai" || imageProvider === "mermaid"
+        ? sanitizeOpenAIError(error instanceof Error ? error.message : "Unexpected server error.")
+        : sanitizeFalError(error instanceof Error ? error.message : "Unexpected server error."),
       createdAt: new Date().toISOString()
     });
   }
