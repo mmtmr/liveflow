@@ -23,8 +23,13 @@ function extractResponseText(payload) {
     .trim();
 }
 
+function compactText(value) {
+  return String(value || "").replace(/\s+/g, " ").trim();
+}
+
 function buildImagePrompt({ transcript, recentTranscript, gestures, strokes, mode, visualAnalysis, generationAnalysis, previousBrief, visualHistory }) {
-  const speech = recentTranscript?.trim() || transcript?.trim() || "The teacher is explaining a concept.";
+  const speech = compactText(recentTranscript) || compactText(transcript);
+  const hasSpeech = speech.length > 0;
   const gestureSummary = gestures?.length
     ? gestures.slice(-8).map((item) => `${item.label} (${item.score})`).join(", ")
     : "No clear gesture detected yet.";
@@ -49,21 +54,22 @@ function buildImagePrompt({ transcript, recentTranscript, gestures, strokes, mod
   return [
     "Create one clear educational visual aid for a live teacher overlay.",
     "The image should be instantly readable in a screen overlay and useful for deaf or hard-of-hearing learners following the lesson visually.",
-    "Use a clean infographic, classroom diagram, or whiteboard visual that directly follows the current lesson.",
+    "Source priority is strict: 1) recent speech transcript, 2) hand-trace direction/grouping, 3) current camera analysis, 4) visual history only for style continuity.",
+    "If recent speech is present, the subject, labels, and teaching point MUST come from that transcript. Do not introduce a different topic from the camera, prior image, or generic classroom assumptions.",
+    "Use hand traces only to decide layout, arrows, emphasis, grouping, or sequence for the spoken concept.",
+    "Use camera analysis only when it directly supports or clarifies the spoken concept. Ignore it if it conflicts with the transcript.",
+    "Use a clean infographic, classroom diagram, or whiteboard visual that directly follows the current spoken lesson.",
     "Preserve continuity: evolve the active idea, add the new concept, and avoid changing style or subject unless the lesson clearly moved on.",
     "If the teacher traced arrows, circles, comparisons, or paths, convert those gestures into semantic arrows, highlights, groupings, or process flow.",
-    "Use the fresh generation snapshot as the strongest signal for what the teacher is pointing at right now.",
-    "Use recent speech as the strongest signal for labels, topic, and intended teaching meaning.",
-    "Prioritize the latest camera scene analysis over generic assumptions when choosing what to draw.",
     "Reflect the teacher's visible pointing, board content, objects, and traced hand paths when they are pedagogically meaningful.",
     "Do not include photorealistic people, clutter, tiny text, brand marks, watermarks, or UI chrome.",
     continuity,
-    `Recent visual history: ${historySummary}`,
-    `Recent speech context: ${speech}`,
-    `Fresh generation snapshot analysis: ${freshSummary}`,
-    `Camera scene analysis: ${sceneSummary}`,
-    `Detected gestures: ${gestureSummary}`,
-    `Teacher traced lines: ${strokeSummary}`,
+    `PRIMARY RECENT SPEECH TRANSCRIPT: ${hasSpeech ? speech : "No transcript yet. Use camera/gesture context cautiously."}`,
+    `SECONDARY HAND TRACE SEMANTICS: ${strokeSummary}`,
+    `SECONDARY DETECTED GESTURES: ${gestureSummary}`,
+    `SECONDARY CURRENT SNAPSHOT ANALYSIS: ${freshSummary}`,
+    `SECONDARY BACKGROUND CAMERA ANALYSIS: ${sceneSummary}`,
+    `STYLE CONTINUITY ONLY - recent visual history: ${historySummary}`,
     `Visual mode: ${mode || "diagram"}`
   ].join("\n");
 }
@@ -78,6 +84,31 @@ function sanitizeFalError(message) {
     .replace(/fal_[A-Za-z0-9_*.-]+/g, "[redacted-api-key]");
 }
 
+async function readResponsePayload(response) {
+  const text = await response.text();
+  if (!text.trim()) return {};
+
+  try {
+    return JSON.parse(text);
+  } catch {
+    return {
+      error: {
+        message: text.slice(0, 500)
+      }
+    };
+  }
+}
+
+function frameAnalysisFallback(error, details) {
+  return {
+    analysis: "",
+    fallback: true,
+    error: sanitizeOpenAIError(error),
+    details,
+    createdAt: new Date().toISOString()
+  };
+}
+
 function numberFromEnv(name, fallback) {
   const value = Number(process.env[name]);
   return Number.isFinite(value) ? value : fallback;
@@ -89,7 +120,8 @@ function getImageProvider(value) {
 }
 
 function buildMermaidPrompt({ transcript, recentTranscript, gestures, strokes, mode, visualAnalysis, previousBrief, visualHistory }) {
-  const speech = recentTranscript?.trim() || transcript?.trim() || "The teacher is explaining a concept.";
+  const speech = compactText(recentTranscript) || compactText(transcript);
+  const hasSpeech = speech.length > 0;
   const gestureSummary = gestures?.length
     ? gestures.slice(-8).map((item) => `${item.label} (${item.score})`).join(", ")
     : "No clear gesture detected.";
@@ -106,15 +138,16 @@ function buildMermaidPrompt({ transcript, recentTranscript, gestures, strokes, m
     "Prefer flowchart TD for processes, cause/effect, comparisons, cycles, or concept maps. Use sequenceDiagram only for clear timelines/conversations.",
     "Keep it readable in an overlay: 4 to 10 nodes, short labels, simple arrows, no dense paragraphs.",
     "Use quoted node labels when labels contain punctuation.",
-    "If the teacher trace implies direction, connection, grouping, cycle, or comparison, encode that in the diagram arrows.",
-    "Recent speech is the strongest signal for topic and labels.",
+    "Source priority is strict: 1) recent speech transcript, 2) hand trace direction/grouping, 3) camera analysis, 4) visual history only for continuity.",
+    "If recent speech is present, every node label and relationship must represent the spoken concept. Do not switch to a camera/history topic.",
+    "If the teacher trace implies direction, connection, grouping, cycle, or comparison, encode that in the arrows for the spoken concept.",
     `Visual mode: ${mode || "diagram"}`,
-    `Recent speech: ${speech}`,
-    `Camera analysis: ${visualAnalysis || "No camera analysis."}`,
-    `Gestures: ${gestureSummary}`,
-    `Traces: ${strokeSummary}`,
-    `Previous brief: ${previousBrief || "none"}`,
-    `Recent visual history: ${historySummary}`
+    `PRIMARY RECENT SPEECH TRANSCRIPT: ${hasSpeech ? speech : "No transcript yet. Use camera/gesture context cautiously."}`,
+    `SECONDARY TRACES: ${strokeSummary}`,
+    `SECONDARY GESTURES: ${gestureSummary}`,
+    `SECONDARY CAMERA ANALYSIS: ${visualAnalysis || "No camera analysis."}`,
+    `STYLE CONTINUITY ONLY - previous brief: ${previousBrief || "none"}`,
+    `STYLE CONTINUITY ONLY - recent visual history: ${historySummary}`
   ].join("\n");
 }
 
@@ -144,7 +177,7 @@ async function analyzeGenerationFrame({ frame, transcript, recentTranscript, ges
   }
 
   const startedAt = Date.now();
-  const speech = recentTranscript || transcript || "";
+  const speech = compactText(recentTranscript) || compactText(transcript);
   const gestureSummary = gestures?.length
     ? gestures.slice(-8).map((item) => `${item.label} (${item.score})`).join(", ")
     : "No gesture labels.";
@@ -170,11 +203,13 @@ async function analyzeGenerationFrame({ frame, transcript, recentTranscript, ges
                 text: [
                   "Analyze this current teacher camera snapshot for text-to-image prompt grounding.",
                   "The image may include colored hand-trace overlays drawn from index-finger movement.",
+                  "Recent speech is the primary lesson source. Interpret the snapshot and traces only as support for that speech.",
+                  "If the image suggests a different topic than the recent speech, ignore the image topic unless readable board text clearly proves the lesson changed.",
                   "Return 4 concise, high-signal bullets only:",
-                  "1. Visible lesson topic, board/object content, or teaching materials.",
-                  "2. What the visible colored traces point to, circle, connect, compare, or move across.",
-                  "3. How the recent speech should change the visual aid.",
-                  "4. The exact visual aid to generate next, including layout and key labels.",
+                  "1. The spoken lesson topic and key terms from the recent speech.",
+                  "2. Visible board/object content only if it supports or refines the spoken topic.",
+                  "3. What the colored traces point to, circle, connect, compare, or sequence for that spoken topic.",
+                  "4. The exact visual aid to generate next, including layout and key labels from the speech.",
                   `Recent speech: ${speech || "No recent speech."}`,
                   `Gesture labels: ${gestureSummary}`,
                   `Stroke metadata: ${strokeSummary}`
@@ -190,7 +225,7 @@ async function analyzeGenerationFrame({ frame, transcript, recentTranscript, ges
       })
     });
 
-    const payload = await response.json();
+    const payload = await readResponsePayload(response);
     if (!response.ok) return { analysis: "", durationMs: Date.now() - startedAt };
 
     return {
@@ -241,7 +276,7 @@ async function generateFalImage({ prompt, requestContext, generationFrame, start
     body: JSON.stringify(requestBody)
   });
 
-  const payload = await response.json();
+  const payload = await readResponsePayload(response);
   const durationMs = Date.now() - startedAt;
 
   if (!response.ok) {
@@ -255,7 +290,7 @@ async function generateFalImage({ prompt, requestContext, generationFrame, start
       contextDurationMs: generationFrame.durationMs,
       generationAnalysis: generationFrame.analysis,
       timings: payload.timings,
-      error: sanitizeFalError(payload.detail || payload.error?.message || payload.message),
+      error: sanitizeFalError(payload.detail || payload.error?.message || payload.message || response.statusText),
       details: payload.error?.type || response.statusText,
       createdAt: new Date().toISOString()
     };
@@ -312,7 +347,7 @@ async function generateOpenAIImage({ prompt, requestContext, generationFrame, st
     })
   });
 
-  const payload = await response.json();
+  const payload = await readResponsePayload(response);
   const durationMs = Date.now() - startedAt;
 
   if (!response.ok) {
@@ -325,7 +360,7 @@ async function generateOpenAIImage({ prompt, requestContext, generationFrame, st
       durationMs,
       contextDurationMs: generationFrame.durationMs,
       generationAnalysis: generationFrame.analysis,
-      error: sanitizeOpenAIError(payload.error?.message),
+      error: sanitizeOpenAIError(payload.error?.message || response.statusText),
       details: payload.error?.type || response.statusText,
       createdAt: new Date().toISOString()
     };
@@ -396,7 +431,7 @@ async function generateMermaidDiagram({ requestContext, generationFrame, started
     })
   });
 
-  const payload = await response.json();
+  const payload = await readResponsePayload(response);
   const durationMs = Date.now() - startedAt;
 
   if (!response.ok) {
@@ -409,7 +444,7 @@ async function generateMermaidDiagram({ requestContext, generationFrame, started
       durationMs,
       contextDurationMs: generationFrame.durationMs,
       generationAnalysis: generationFrame.analysis,
-      error: sanitizeOpenAIError(payload.error?.message),
+      error: sanitizeOpenAIError(payload.error?.message || response.statusText),
       details: payload.error?.type || response.statusText,
       createdAt: new Date().toISOString()
     };
@@ -481,12 +516,31 @@ app.get("/api/health", (_req, res) => {
   });
 });
 
-app.get("/api/realtime-token", async (_req, res) => {
+const realtimeLanguages = {
+  en: {
+    code: "en",
+    label: "English",
+    instructions: "Listen for English speech only. Transcribe English accurately. Do not translate."
+  },
+  zh: {
+    code: "zh",
+    label: "Chinese",
+    instructions: "Listen for Chinese speech only. Transcribe Chinese accurately using Chinese characters. Do not translate."
+  }
+};
+
+function getRealtimeLanguage(value) {
+  return realtimeLanguages[String(value || "").toLowerCase()] || realtimeLanguages.en;
+}
+
+app.get("/api/realtime-token", async (req, res) => {
   if (!process.env.OPENAI_API_KEY) {
     return res.status(500).json({
       error: "OPENAI_API_KEY is not available to the server process."
     });
   }
+
+  const realtimeLanguage = getRealtimeLanguage(req.query.language);
 
   try {
     const response = await fetch("https://api.openai.com/v1/realtime/client_secrets", {
@@ -499,14 +553,13 @@ app.get("/api/realtime-token", async (_req, res) => {
         session: {
           type: "realtime",
           model: process.env.OPENAI_REALTIME_MODEL || "gpt-realtime-2",
-          instructions: "Listen to the teacher and transcribe accurately. Do not generate spoken audio responses.",
+          instructions: `${realtimeLanguage.instructions} Do not generate spoken audio responses.`,
           audio: {
             input: {
               noise_reduction: { type: "near_field" },
               transcription: {
                 model: process.env.OPENAI_TRANSCRIBE_MODEL || "gpt-4o-transcribe",
-                language: "en",
-                prompt: "Classroom teaching, technical terminology, diagrams, hand gestures, and visual explanations."
+                language: realtimeLanguage.code
               },
               turn_detection: {
                 type: "server_vad",
@@ -521,10 +574,10 @@ app.get("/api/realtime-token", async (_req, res) => {
       })
     });
 
-    const payload = await response.json();
+    const payload = await readResponsePayload(response);
     if (!response.ok) {
       return res.status(response.status).json({
-        error: sanitizeOpenAIError(payload.error?.message),
+        error: sanitizeOpenAIError(payload.error?.message || response.statusText),
         details: payload.error?.type || response.statusText
       });
     }
@@ -532,6 +585,7 @@ app.get("/api/realtime-token", async (_req, res) => {
     res.json({
       value: payload.value || payload.client_secret?.value,
       expiresAt: payload.expires_at || payload.client_secret?.expires_at,
+      language: realtimeLanguage.code,
       model: payload.session?.model
     });
   } catch (error) {
@@ -543,12 +597,10 @@ app.get("/api/realtime-token", async (_req, res) => {
 
 app.post("/api/analyze-frame", async (req, res) => {
   if (!process.env.OPENAI_API_KEY) {
-    return res.status(500).json({
-      error: "OPENAI_API_KEY is not available to the server process."
-    });
+    return res.json(frameAnalysisFallback("OPENAI_API_KEY is not available to the server process.", "missing_api_key"));
   }
 
-  const { frame, transcript, gestures, strokes } = req.body || {};
+  const { frame, transcript, recentTranscript, gestures, strokes } = req.body || {};
   if (!frame || !String(frame).startsWith("data:image/")) {
     return res.status(400).json({
       error: "A camera frame data URL is required."
@@ -556,7 +608,7 @@ app.post("/api/analyze-frame", async (req, res) => {
   }
 
   const context = [
-    transcript ? `Recent speech: ${transcript}` : "",
+    recentTranscript || transcript ? `Primary recent speech: ${compactText(recentTranscript) || compactText(transcript)}` : "",
     gestures?.length ? `Recent gestures: ${gestures.slice(-6).map((item) => item.label).join(", ")}` : "",
     strokes?.length ? `Recent traces: ${strokes.slice(-4).map((stroke) => `${stroke.hand || "hand"} ${stroke.direction}`).join("; ")}` : ""
   ].filter(Boolean).join("\n");
@@ -578,10 +630,12 @@ app.post("/api/analyze-frame", async (req, res) => {
                 type: "input_text",
                 text: [
                   "Analyze this live teaching camera frame for an assistive visual-generation system.",
+                  "Use the recent speech as the primary source of lesson meaning. The frame and hand traces should explain emphasis, layout, or board references for that speech.",
+                  "If the camera appears unrelated to the speech, say that clearly and keep the suggested visual anchored to the speech.",
                   "Return 3 concise bullets only:",
-                  "1. What topic or board/object content appears visible.",
-                  "2. What the teacher's hands/traces seem to emphasize.",
-                  "3. What visual aid should be generated next.",
+                  "1. Spoken lesson topic and any visible board/object content that supports it.",
+                  "2. What the teacher's hands/traces seem to emphasize for the spoken topic.",
+                  "3. What visual aid should be generated next, using labels from the speech.",
                   context
                 ].filter(Boolean).join("\n")
               },
@@ -595,12 +649,12 @@ app.post("/api/analyze-frame", async (req, res) => {
       })
     });
 
-    const payload = await response.json();
+    const payload = await readResponsePayload(response);
     if (!response.ok) {
-      return res.status(response.status).json({
-        error: sanitizeOpenAIError(payload.error?.message),
-        details: payload.error?.type || response.statusText
-      });
+      return res.json(frameAnalysisFallback(
+        payload.error?.message || response.statusText || "Frame analysis failed.",
+        payload.error?.type || response.statusText || `HTTP ${response.status}`
+      ));
     }
 
     res.json({
@@ -608,9 +662,10 @@ app.post("/api/analyze-frame", async (req, res) => {
       createdAt: new Date().toISOString()
     });
   } catch (error) {
-    res.status(500).json({
-      error: sanitizeOpenAIError(error instanceof Error ? error.message : "Frame analysis failed.")
-    });
+    res.json(frameAnalysisFallback(
+      error instanceof Error ? error.message : "Frame analysis failed.",
+      "request_failed"
+    ));
   }
 });
 
@@ -618,16 +673,18 @@ app.post("/api/generate", async (req, res) => {
   const startedAt = Date.now();
   const requestContext = req.body || {};
   const imageProvider = getImageProvider(requestContext.imageProvider);
-
-  const generationFrame = imageProvider === "openai" || requestContext.forceGenerationAnalysis
-    ? await analyzeGenerationFrame(requestContext)
-    : { analysis: "", durationMs: 0 };
-  const prompt = buildImagePrompt({
-    ...requestContext,
-    generationAnalysis: generationFrame.analysis
-  });
+  let generationFrame = { analysis: "", durationMs: 0 };
+  let prompt = "";
 
   try {
+    generationFrame = imageProvider === "openai" || requestContext.forceGenerationAnalysis
+      ? await analyzeGenerationFrame(requestContext)
+      : generationFrame;
+    prompt = buildImagePrompt({
+      ...requestContext,
+      generationAnalysis: generationFrame.analysis
+    });
+
     const result = imageProvider === "mermaid"
       ? await generateMermaidDiagram({ requestContext, generationFrame, startedAt })
       : imageProvider === "openai"
@@ -637,9 +694,13 @@ app.post("/api/generate", async (req, res) => {
   } catch (error) {
     const providerLabel = imageProvider === "mermaid" ? "Mermaid" : imageProvider === "openai" ? "OpenAI" : "fal.ai";
     const model = imageProvider === "mermaid" ? mermaidModel : imageProvider === "openai" ? openAIImageModel : falImageModel;
+    const fallbackPrompt = prompt || buildImagePrompt({
+      ...requestContext,
+      generationAnalysis: generationFrame.analysis
+    });
     res.status(200).json({
       imageUrl: makeFallbackImage(requestContext),
-      prompt,
+      prompt: fallbackPrompt,
       fallback: true,
       provider: providerLabel,
       model,

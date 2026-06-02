@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { FilesetResolver, GestureRecognizer, DrawingUtils } from "@mediapipe/tasks-vision";
+import mermaidScriptUrl from "mermaid/dist/mermaid.min.js?url";
 
 const AUTO_INTERVAL_MS = 6200;
 const FRAME_ANALYSIS_INTERVAL_MS = 3200;
@@ -7,10 +8,17 @@ const MAX_PARALLEL_GENERATIONS = 3;
 const MAX_EVENTS = 10;
 const MAX_STROKES = 8;
 const MAX_VISUAL_HISTORY = 5;
-const RECENT_TRANSCRIPT_WORDS = 90;
+const RECENT_TRANSCRIPT_WORDS = 160;
 const HAND_TRIGGER_COOLDOWN_MS = 4800;
+const VOICE_CONNECT_TIMEOUT_MS = 15000;
+const VOICE_RECONNECT_DELAY_MS = 900;
+const MAX_VOICE_RECONNECTS = 2;
 const HAND_TRACE_COLORS = ["#ffcf5a", "#61dafb"];
 const OPEN_HAND_LABELS = new Set(["open_palm", "open palm"]);
+const VOICE_LANGUAGE_OPTIONS = [
+  { value: "en", label: "English" },
+  { value: "zh", label: "Chinese" }
+];
 
 const MERMAID_CONFIG = {
   startOnLoad: false,
@@ -33,9 +41,14 @@ const MERMAID_CONFIG = {
 };
 
 let mermaidRuntime = null;
+let mermaidLoadPromise = null;
 
 function nowTime() {
   return new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" });
+}
+
+function getVoiceLanguageOption(value) {
+  return VOICE_LANGUAGE_OPTIONS.find((option) => option.value === value) || VOICE_LANGUAGE_OPTIONS[0];
 }
 
 function formatLatency(ms) {
@@ -72,6 +85,19 @@ function recentWords(value, limit = RECENT_TRANSCRIPT_WORDS) {
   return words.slice(-limit).join(" ");
 }
 
+function newestFirstTranscript(value) {
+  return String(value || "")
+    .split("\n")
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .reverse()
+    .join("\n");
+}
+
+function chronologicalTranscript(value) {
+  return newestFirstTranscript(value);
+}
+
 function isOpenHandGesture(label) {
   return OPEN_HAND_LABELS.has(String(label || "").toLowerCase().replace(/-/g, "_"));
 }
@@ -90,7 +116,17 @@ function captureCanvasFrame(canvas, maxWidth = 640, quality = 0.72) {
 
 async function renderMermaidImage(code, generationId) {
   if (!mermaidRuntime) {
-    await import("mermaid/dist/mermaid.js");
+    if (!mermaidLoadPromise) {
+      mermaidLoadPromise = new Promise((resolve, reject) => {
+        const script = document.createElement("script");
+        script.src = mermaidScriptUrl;
+        script.async = true;
+        script.onload = () => resolve();
+        script.onerror = () => reject(new Error("Mermaid renderer did not load."));
+        document.head.appendChild(script);
+      });
+    }
+    await mermaidLoadPromise;
     mermaidRuntime = globalThis.mermaid;
     if (!mermaidRuntime) {
       throw new Error("Mermaid renderer did not load.");
@@ -168,9 +204,48 @@ function withTimeout(promise, ms, message) {
   return Promise.race([promise, timeout]).finally(() => window.clearTimeout(timeoutId));
 }
 
+async function readApiPayload(response) {
+  const text = await response.text();
+  if (!text.trim()) return {};
+
+  try {
+    return JSON.parse(text);
+  } catch {
+    return {
+      error: text.slice(0, 500)
+    };
+  }
+}
+
+function getPayloadError(payload, fallback) {
+  if (typeof payload?.error === "string") return payload.error;
+  return payload?.error?.message || payload?.message || fallback;
+}
+
+function getRealtimeTranscript(event) {
+  if (typeof event?.transcript === "string") return event.transcript;
+  if (typeof event?.text === "string") return event.text;
+
+  const content = event?.item?.content;
+  if (!Array.isArray(content)) return "";
+
+  return content
+    .map((part) => part?.transcript || part?.text || "")
+    .filter(Boolean)
+    .join(" ")
+    .trim();
+}
+
 function useRealtimeVoice() {
   const peerRef = useRef(null);
+  const dataChannelRef = useRef(null);
   const micStreamRef = useRef(null);
+  const reconnectTimerRef = useRef(0);
+  const startingRef = useRef(false);
+  const shouldListenRef = useRef(false);
+  const sessionRef = useRef(0);
+  const languageRef = useRef(VOICE_LANGUAGE_OPTIONS[0].value);
+  const reconnectAttemptsRef = useRef(0);
   const [supported] = useState(() => Boolean(window.RTCPeerConnection && navigator.mediaDevices?.getUserMedia));
   const [listening, setListening] = useState(false);
   const [voiceStatus, setVoiceStatus] = useState("idle");
@@ -178,32 +253,71 @@ function useRealtimeVoice() {
   const [finalTranscript, setFinalTranscript] = useState("");
   const [partialTranscript, setPartialTranscript] = useState("");
 
-  const transcript = [finalTranscript, partialTranscript].filter(Boolean).join(" ").trim();
+  const transcript = [finalTranscript, partialTranscript].filter(Boolean).join("\n").trim();
+  const speechContext = [partialTranscript, newestFirstTranscript(finalTranscript)].filter(Boolean).join("\n").trim();
 
   const setTranscript = useCallback((value) => {
     setFinalTranscript(value);
     setPartialTranscript("");
   }, []);
 
-  const stop = useCallback(() => {
+  const setSpeechContext = useCallback((value) => {
+    setFinalTranscript(chronologicalTranscript(value));
+    setPartialTranscript("");
+  }, []);
+
+  const stopConnection = useCallback(({ resetStatus = true } = {}) => {
+    window.clearTimeout(reconnectTimerRef.current);
+    reconnectTimerRef.current = 0;
+    shouldListenRef.current = false;
+    reconnectAttemptsRef.current = 0;
+    sessionRef.current += 1;
+
+    if (dataChannelRef.current) {
+      dataChannelRef.current.onopen = null;
+      dataChannelRef.current.onmessage = null;
+      dataChannelRef.current.onerror = null;
+      dataChannelRef.current.onclose = null;
+      dataChannelRef.current.close();
+      dataChannelRef.current = null;
+    }
+
     peerRef.current?.close();
     peerRef.current = null;
     micStreamRef.current?.getTracks().forEach((track) => track.stop());
     micStreamRef.current = null;
     setListening(false);
-    setVoiceStatus("idle");
+    if (resetStatus) setVoiceStatus("idle");
   }, []);
 
-  const handleRealtimeEvent = useCallback((event) => {
+  const stop = useCallback(() => {
+    stopConnection({ resetStatus: true });
+  }, [stopConnection]);
+
+  const commitTranscript = useCallback((text) => {
+    const nextTranscript = String(text || "").replace(/\s+/g, " ").trim();
+    if (!nextTranscript) return;
+    setFinalTranscript((value) => [value, nextTranscript].filter(Boolean).join("\n").trim());
+    setPartialTranscript("");
+  }, []);
+
+  const handleRealtimeEvent = useCallback((event, sessionId) => {
+    if (sessionId !== sessionRef.current) return;
+
     if (event.type === "conversation.item.input_audio_transcription.delta" && event.delta) {
       setPartialTranscript((value) => `${value}${event.delta}`);
       setVoiceStatus("transcribing");
     }
 
-    if (event.type === "conversation.item.input_audio_transcription.completed" && event.transcript) {
-      setFinalTranscript((value) => `${value} ${event.transcript}`.trim());
+    if (event.type === "conversation.item.input_audio_transcription.completed") {
+      commitTranscript(getRealtimeTranscript(event));
+      setVoiceStatus("listening");
+    }
+
+    if (event.type === "conversation.item.input_audio_transcription.failed") {
       setPartialTranscript("");
       setVoiceStatus("listening");
+      setVoiceError(event.error?.message || "Speech segment could not be transcribed. Listening continues.");
     }
 
     if (event.type === "input_audio_buffer.speech_started") {
@@ -213,31 +327,97 @@ function useRealtimeVoice() {
     if (event.type === "input_audio_buffer.speech_stopped") {
       setVoiceStatus("processing speech");
     }
-  }, []);
+  }, [commitTranscript]);
 
-  const start = useCallback(async () => {
-    if (listening) return;
+  const start = useCallback(async (language = VOICE_LANGUAGE_OPTIONS[0].value) => {
+    if (startingRef.current || peerRef.current) return;
+    const selectedLanguage = getVoiceLanguageOption(language).value;
+    const sessionId = sessionRef.current + 1;
+    sessionRef.current = sessionId;
+    shouldListenRef.current = true;
+    languageRef.current = selectedLanguage;
+    startingRef.current = true;
     setVoiceError("");
     setVoiceStatus("connecting");
 
+    const scheduleReconnect = () => {
+      if (!shouldListenRef.current || sessionId !== sessionRef.current) return;
+      if (reconnectTimerRef.current) return;
+      if (reconnectAttemptsRef.current >= MAX_VOICE_RECONNECTS) {
+        stopConnection({ resetStatus: false });
+        setVoiceStatus("error");
+        setVoiceError("Realtime speech connection dropped. Please start live again.");
+        return;
+      }
+
+      reconnectAttemptsRef.current += 1;
+      setVoiceStatus("reconnecting");
+      if (dataChannelRef.current) {
+        dataChannelRef.current.onopen = null;
+        dataChannelRef.current.onmessage = null;
+        dataChannelRef.current.onerror = null;
+        dataChannelRef.current.onclose = null;
+        dataChannelRef.current.close();
+        dataChannelRef.current = null;
+      }
+      peerRef.current?.close();
+      peerRef.current = null;
+      micStreamRef.current?.getTracks().forEach((track) => track.stop());
+      micStreamRef.current = null;
+
+      window.clearTimeout(reconnectTimerRef.current);
+      reconnectTimerRef.current = window.setTimeout(() => {
+        reconnectTimerRef.current = 0;
+        start(languageRef.current);
+      }, VOICE_RECONNECT_DELAY_MS);
+    };
+
     try {
-      const tokenResponse = await fetch("/api/realtime-token");
-      const tokenPayload = await tokenResponse.json();
+      const tokenResponse = await fetch(`/api/realtime-token?language=${encodeURIComponent(selectedLanguage)}`);
+      const tokenPayload = await readApiPayload(tokenResponse);
       if (!tokenResponse.ok || !tokenPayload.value) {
-        throw new Error(tokenPayload.error || "Could not create a Realtime session token.");
+        throw new Error(getPayloadError(tokenPayload, "Could not create a Realtime session token."));
       }
 
       const peer = new RTCPeerConnection();
       peerRef.current = peer;
+      peer.onconnectionstatechange = () => {
+        if (sessionId !== sessionRef.current) return;
+        if (peer.connectionState === "connected") {
+          reconnectAttemptsRef.current = 0;
+          setListening(true);
+          setVoiceStatus("listening");
+        }
+        if (["failed", "disconnected"].includes(peer.connectionState)) {
+          scheduleReconnect();
+        }
+      };
+      peer.oniceconnectionstatechange = () => {
+        if (sessionId !== sessionRef.current) return;
+        if (["failed", "disconnected"].includes(peer.iceConnectionState)) {
+          scheduleReconnect();
+        }
+      };
 
       const dataChannel = peer.createDataChannel("oai-events");
-      dataChannel.onopen = () => setVoiceStatus("listening");
+      dataChannelRef.current = dataChannel;
+      dataChannel.onopen = () => {
+        if (sessionId !== sessionRef.current) return;
+        setVoiceStatus("listening");
+      };
       dataChannel.onmessage = (message) => {
+        if (sessionId !== sessionRef.current) return;
         try {
-          handleRealtimeEvent(JSON.parse(message.data));
+          handleRealtimeEvent(JSON.parse(message.data), sessionId);
         } catch {
           setVoiceStatus("received unreadable event");
         }
+      };
+      dataChannel.onerror = () => {
+        if (sessionId === sessionRef.current) scheduleReconnect();
+      };
+      dataChannel.onclose = () => {
+        if (shouldListenRef.current && sessionId === sessionRef.current) scheduleReconnect();
       };
 
       const micStream = await navigator.mediaDevices.getUserMedia({
@@ -248,39 +428,59 @@ function useRealtimeVoice() {
         }
       });
       micStreamRef.current = micStream;
-      peer.addTrack(micStream.getAudioTracks()[0], micStream);
+      const [micTrack] = micStream.getAudioTracks();
+      if (!micTrack) {
+        throw new Error("No microphone input track was available.");
+      }
+      micTrack.onended = () => {
+        if (sessionId === sessionRef.current) {
+          stopConnection({ resetStatus: false });
+          setVoiceStatus("error");
+          setVoiceError("Microphone input stopped. Please start live again.");
+        }
+      };
+      peer.addTrack(micTrack, micStream);
 
       const offer = await peer.createOffer();
       await peer.setLocalDescription(offer);
 
-      const answerResponse = await fetch("https://api.openai.com/v1/realtime/calls", {
-        method: "POST",
-        body: offer.sdp,
-        headers: {
-          Authorization: `Bearer ${tokenPayload.value}`,
-          "Content-Type": "application/sdp"
-        }
-      });
+      const answerResponse = await withTimeout(
+        fetch("https://api.openai.com/v1/realtime/calls", {
+          method: "POST",
+          body: offer.sdp,
+          headers: {
+            Authorization: `Bearer ${tokenPayload.value}`,
+            "Content-Type": "application/sdp"
+          }
+        }),
+        VOICE_CONNECT_TIMEOUT_MS,
+        "Realtime connection timed out."
+      );
 
+      const answerText = await withTimeout(answerResponse.text(), VOICE_CONNECT_TIMEOUT_MS, "Realtime connection timed out.");
       if (!answerResponse.ok) {
-        throw new Error(await answerResponse.text());
+        throw new Error(answerText);
       }
 
       await peer.setRemoteDescription({
         type: "answer",
-        sdp: await answerResponse.text()
+        sdp: answerText
       });
 
       setListening(true);
       setVoiceStatus("listening");
     } catch (error) {
-      stop();
+      stopConnection({ resetStatus: false });
       setVoiceStatus("error");
       setVoiceError(error instanceof Error ? error.message : "Realtime voice failed.");
+    } finally {
+      startingRef.current = false;
     }
-  }, [handleRealtimeEvent, listening, stop]);
+  }, [handleRealtimeEvent, stopConnection]);
 
-  return { supported, listening, transcript, setTranscript, start, stop, voiceStatus, voiceError };
+  useEffect(() => stopConnection, [stopConnection]);
+
+  return { supported, listening, transcript, speechContext, setTranscript, setSpeechContext, start, stop, voiceStatus, voiceError };
 }
 
 function App() {
@@ -303,8 +503,10 @@ function App() {
   const lastContextFingerprintRef = useRef("");
   const lastHandTriggerRef = useRef(0);
   const handTriggerArmedRef = useRef(true);
+  const handTriggerCueTimeoutRef = useRef(0);
+  const contextEpochRef = useRef(0);
 
-  const { supported, listening, transcript, setTranscript, start, stop, voiceStatus, voiceError } = useRealtimeVoice();
+  const { supported, listening, transcript, speechContext, setTranscript, setSpeechContext, start, stop, voiceStatus, voiceError } = useRealtimeVoice();
   const [cameraOn, setCameraOn] = useState(false);
   const [trackingState, setTrackingState] = useState("idle");
   const [gestureEvents, setGestureEvents] = useState([]);
@@ -312,7 +514,7 @@ function App() {
   const [isDrawing, setIsDrawing] = useState(true);
   const [autoGenerate, setAutoGenerate] = useState(true);
   const [generationTriggerMode, setGenerationTriggerMode] = useState("continuous");
-  const [imageProvider, setImageProvider] = useState("fal");
+  const [imageProvider, setImageProvider] = useState("openai");
   const [mode, setMode] = useState("diagram");
   const [status, setStatus] = useState("Ready");
   const [image, setImage] = useState(null);
@@ -332,6 +534,10 @@ function App() {
   const [overlayExpanded, setOverlayExpanded] = useState(false);
   const [overlaySide, setOverlaySide] = useState("right");
   const [handActivity, setHandActivity] = useState("waiting for hands");
+  const [voiceLanguage, setVoiceLanguage] = useState(VOICE_LANGUAGE_OPTIONS[0].value);
+
+  const voiceLanguageLabel = getVoiceLanguageOption(voiceLanguage).label;
+  const [handTriggerCue, setHandTriggerCue] = useState(null);
 
   const logDiagnostic = useCallback((message) => {
     setDiagnostics((items) => [`${nowTime()} ${message}`, ...items].slice(0, 6));
@@ -387,6 +593,18 @@ function App() {
     setStatus(nextMode === "hands" ? "Show two open hands to generate" : "Continuous generation ready");
   }, []);
 
+  const flashHandTriggerCue = useCallback(() => {
+    window.clearTimeout(handTriggerCueTimeoutRef.current);
+    setHandTriggerCue({
+      id: Date.now(),
+      title: "Two hands detected",
+      detail: "Generating visual"
+    });
+    handTriggerCueTimeoutRef.current = window.setTimeout(() => {
+      setHandTriggerCue(null);
+    }, 1400);
+  }, []);
+
   const updateImage = useCallback((nextImage) => {
     imageRef.current = nextImage;
     setImage(nextImage);
@@ -404,6 +622,7 @@ function App() {
     }
 
     const generationId = generationSerialRef.current + 1;
+    const contextEpoch = contextEpochRef.current;
     generationSerialRef.current = generationId;
     inFlightGenerationCountRef.current += 1;
     setPendingGenerations(inFlightGenerationCountRef.current);
@@ -433,11 +652,13 @@ function App() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(requestContext)
       });
-      const payload = await response.json();
-      if (!response.ok) throw new Error(payload.error || "Generation failed.");
+      const payload = await readApiPayload(response);
+      if (!response.ok) throw new Error(getPayloadError(payload, "Generation failed."));
       const nextImageUrl = payload.diagramType === "mermaid"
         ? await renderMermaidImage(payload.mermaidCode, generationId)
         : payload.imageUrl;
+
+      if (contextEpochRef.current !== contextEpoch) return;
 
       const shouldReplaceImage = generationId > displayedGenerationRef.current && nextImageUrl && (!payload.fallback || !imageRef.current);
       if (shouldReplaceImage) {
@@ -482,6 +703,7 @@ function App() {
         model: payload.model
       } : item));
     } catch (generationError) {
+      if (contextEpochRef.current !== contextEpoch) return;
       setError(generationError instanceof Error ? generationError.message : "Generation failed.");
       setStatus(imageRef.current ? `Kept last visual ${nowTime()}` : "Generation paused");
       setGenerationQueue((items) => items.map((item) => item.id === generationId ? { ...item, status: "error" } : item));
@@ -517,9 +739,15 @@ function App() {
           strokes: [...strokes, ...liveStrokes].slice(-MAX_STROKES)
         })
       });
-      const payload = await response.json();
-      if (!response.ok) throw new Error(payload.error || "Frame analysis failed.");
-      setVisualAnalysis(payload.analysis || "");
+      const payload = await readApiPayload(response);
+      if (!response.ok) throw new Error(getPayloadError(payload, "Frame analysis failed."));
+      if (payload.fallback) {
+        setAnalysisStatus(`analysis unavailable ${nowTime()}`);
+        return;
+      }
+      if (payload.analysis) {
+        setVisualAnalysis(payload.analysis);
+      }
       setAnalysisStatus(`updated ${nowTime()}`);
       if (autoGenerate && generationTriggerMode === "continuous" && Date.now() - lastGenerationRef.current > 2500) {
         generateImage({ force: false, reason: "vision update" });
@@ -601,16 +829,33 @@ function App() {
     setStatus("Starting camera and realtime...");
     await Promise.all([
       startCamera(),
-      supported && !listening ? start() : Promise.resolve()
+      supported && !listening ? start(voiceLanguage) : Promise.resolve()
     ]);
     setStatus("Live session running");
-  }, [listening, start, startCamera, supported]);
+  }, [listening, start, startCamera, supported, voiceLanguage]);
 
   const stopLiveSession = useCallback(() => {
     stopCamera();
     stop();
     setStatus("Live session stopped");
   }, [stop, stopCamera]);
+
+  const changeVoiceLanguage = useCallback(async (nextLanguage) => {
+    if (nextLanguage === voiceLanguage) return;
+    const nextLabel = getVoiceLanguageOption(nextLanguage).label;
+    setVoiceLanguage(nextLanguage);
+    setError("");
+
+    if (listening) {
+      stop();
+      setStatus(`Restarting voice for ${nextLabel}`);
+      await start(nextLanguage);
+      setStatus(`Listening for ${nextLabel}`);
+      return;
+    }
+
+    setStatus(`Listening language set to ${nextLabel}`);
+  }, [listening, start, stop, voiceLanguage]);
 
   useEffect(() => {
     if (!cameraOn) return;
@@ -684,6 +929,7 @@ function App() {
         ) {
           handTriggerArmedRef.current = false;
           lastHandTriggerRef.current = Date.now();
+          flashHandTriggerCue();
           generateImage({ force: false, reason: "two open hands" });
         }
 
@@ -719,7 +965,11 @@ function App() {
 
     rafRef.current = requestAnimationFrame(drawFrame);
     return () => cancelAnimationFrame(rafRef.current);
-  }, [addGesture, autoGenerate, cameraOn, generateImage, generationTriggerMode, isDrawing, visualLocked]);
+  }, [addGesture, autoGenerate, cameraOn, flashHandTriggerCue, generateImage, generationTriggerMode, isDrawing, visualLocked]);
+
+  useEffect(() => {
+    return () => window.clearTimeout(handTriggerCueTimeoutRef.current);
+  }, []);
 
   useEffect(() => {
     if (!autoGenerate || visualLocked || generationTriggerMode !== "continuous") return;
@@ -757,7 +1007,11 @@ function App() {
     strokeRef.current = [[], []];
   };
 
-  const clearContext = () => {
+  const clearContext = useCallback(() => {
+    contextEpochRef.current += 1;
+    lastContextFingerprintRef.current = "";
+    lastGenerationRef.current = 0;
+    displayedGenerationRef.current = generationSerialRef.current;
     strokeRef.current = [[], []];
     setStrokes([]);
     setGestureEvents([]);
@@ -765,12 +1019,18 @@ function App() {
     setPrompt("");
     setError("");
     setVisualAnalysis("");
+    updateImage(null);
     setInstantPreview(null);
     setCurrentBrief("");
+    setVisualHistory([]);
     setGenerationQueue([]);
+    setGenerationMetrics(null);
     setVisualLocked(false);
+    window.clearTimeout(handTriggerCueTimeoutRef.current);
+    setHandTriggerCue(null);
     setAnalysisStatus(cameraOn ? "waiting for frame" : "waiting for camera");
-  };
+    setStatus("Context cleared");
+  }, [cameraOn, setTranscript, updateImage]);
 
   const visualSource = image || instantPreview;
   const visualLabel = image ? "Generated teaching aid" : "Instant teaching sketch";
@@ -780,7 +1040,7 @@ function App() {
       <section className="lecture-stage">
         <header className="topbar lecture-topbar">
           <div>
-            <h1>Teaching Image Assist V2</h1>
+            <h1>LiveFlow</h1>
             <p>Live lesson copilot with adaptive visual memory</p>
           </div>
           <div className={`status-light ${cameraOn ? "live" : ""}`}>
@@ -793,6 +1053,15 @@ function App() {
           <video ref={videoRef} playsInline muted />
           <canvas ref={canvasRef} />
           {!cameraOn && <div className="camera-empty">Camera preview appears here</div>}
+          {handTriggerCue && (
+            <div key={handTriggerCue.id} className="hand-trigger-cue" role="status" aria-live="polite">
+              <span />
+              <div>
+                <strong>{handTriggerCue.title}</strong>
+                <small>{handTriggerCue.detail}</small>
+              </div>
+            </div>
+          )}
 
           {!overlayHidden && (
             <section className={`visual-stage side-${overlaySide} ${overlayExpanded ? "expanded" : ""} ${pendingGenerations ? "is-generating" : ""}`}>
@@ -852,12 +1121,29 @@ function App() {
             <div className="panel transcript-panel">
               <div className="panel-header">
                 <h2>Speech context</h2>
-                <span>{supported ? voiceStatus : "manual"}</span>
+                <div className="panel-actions">
+                  <div className="segmented language-mode" role="group" aria-label="Speech language">
+                    {VOICE_LANGUAGE_OPTIONS.map((option) => (
+                      <button
+                        key={option.value}
+                        className={voiceLanguage === option.value ? "selected" : ""}
+                        onClick={() => changeVoiceLanguage(option.value)}
+                        aria-pressed={voiceLanguage === option.value}
+                      >
+                        {option.label}
+                      </button>
+                    ))}
+                  </div>
+                  <span>{supported ? `${voiceLanguageLabel} · ${voiceStatus}` : "manual"}</span>
+                  <button className="panel-action danger" onClick={clearContext} title="Clear speech, visual, gesture, and trace context">
+                    Clear context
+                  </button>
+                </div>
               </div>
               <textarea
-                value={transcript}
-                onChange={(event) => setTranscript(event.target.value)}
-                placeholder="Start live, or type lesson context here..."
+                value={speechContext}
+                onChange={(event) => setSpeechContext(event.target.value)}
+                placeholder={`Start live in ${voiceLanguageLabel}, or type lesson context here...`}
               />
               {voiceError && <div className="inline-error">{voiceError}</div>}
             </div>
@@ -865,46 +1151,62 @@ function App() {
 
           {error && <div className="error-banner">{error}</div>}
 
-          <div className="lecture-controls">
-            <button onClick={cameraOn || listening ? stopLiveSession : startLiveSession}>
-              {cameraOn || listening ? "Stop live" : "Start live"}
-            </button>
-            <label className="switch">
-              <input type="checkbox" checked={autoGenerate} onChange={(event) => setAutoGenerate(event.target.checked)} />
-              <span>Auto</span>
-            </label>
-            <div className="segmented trigger-mode">
-              {[
-                ["continuous", "Continuous"],
-                ["hands", "2 hands"]
-              ].map(([value, label]) => (
-                <button key={value} className={generationTriggerMode === value ? "selected" : ""} onClick={() => setTriggerMode(value)}>
-                  {label}
-                </button>
-              ))}
+          <div className="lecture-controls" role="toolbar" aria-label="Live teaching controls">
+            <div className="dock-group dock-session">
+              <button className="dock-primary" onClick={cameraOn || listening ? stopLiveSession : startLiveSession}>
+                {cameraOn || listening ? "Stop live" : "Start live"}
+              </button>
+              <label className="switch">
+                <input type="checkbox" checked={autoGenerate} onChange={(event) => setAutoGenerate(event.target.checked)} />
+                <span>Auto</span>
+              </label>
             </div>
-            <div className="segmented provider-mode">
-              {[
-                ["fal", "Flux"],
-                ["openai", "GPT Image 2"],
-                ["mermaid", "Mermaid"]
-              ].map(([value, label]) => (
-                <button key={value} className={imageProvider === value ? "selected" : ""} onClick={() => setImageProvider(value)}>
-                  {label}
-                </button>
-              ))}
+
+            <div className="dock-group dock-modes">
+              <div className="segmented trigger-mode">
+                {[
+                  ["continuous", "Continuous"],
+                  ["hands", "2 hands"]
+                ].map(([value, label]) => (
+                  <button key={value} className={generationTriggerMode === value ? "selected" : ""} onClick={() => setTriggerMode(value)}>
+                    {label}
+                  </button>
+                ))}
+              </div>
+              <div className="segmented provider-mode">
+                {[
+                  ["fal", "Flux"],
+                  ["openai", "GPT Image 2"],
+                  ["mermaid", "Mermaid"]
+                ].map(([value, label]) => (
+                  <button key={value} className={imageProvider === value ? "selected" : ""} onClick={() => setImageProvider(value)}>
+                    {label}
+                  </button>
+                ))}
+              </div>
+              <div className="segmented compact">
+                {["diagram", "metaphor", "steps"].map((item) => (
+                  <button key={item} className={mode === item ? "selected" : ""} onClick={() => setMode(item)}>
+                    {item}
+                  </button>
+                ))}
+              </div>
             </div>
-            <div className="segmented compact">
-              {["diagram", "metaphor", "steps"].map((item) => (
-                <button key={item} className={mode === item ? "selected" : ""} onClick={() => setMode(item)}>
-                  {item}
-                </button>
-              ))}
+
+            <div className="dock-group dock-actions">
+              <button className={`dock-action ${isDrawing ? "is-active" : ""}`} onClick={() => setIsDrawing((value) => !value)} title={isDrawing ? "Pause trace" : "Resume trace"}>
+                Trace
+              </button>
+              <button className="dock-action" onClick={commitStroke} title="Commit trace">
+                Commit
+              </button>
+              <button className={`dock-action ${!overlayHidden ? "is-active" : ""}`} onClick={() => setOverlayHidden((value) => !value)} title={overlayHidden ? "Show visual" : "Hide visual"}>
+                Visual
+              </button>
+              <button className="dock-action danger" onClick={clearContext} title="Clear context">
+                Clear
+              </button>
             </div>
-            <button onClick={() => setIsDrawing((value) => !value)}>{isDrawing ? "Pause trace" : "Resume trace"}</button>
-            <button onClick={commitStroke}>Commit trace</button>
-            <button onClick={() => setOverlayHidden((value) => !value)}>{overlayHidden ? "Show visual" : "Hide visual"}</button>
-            <button onClick={clearContext}>Clear</button>
           </div>
         </div>
       </section>

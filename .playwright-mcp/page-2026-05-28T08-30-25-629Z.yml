@@ -1,0 +1,91 @@
+- main [ref=e3]:
+  - generic [ref=e4]:
+    - generic:
+      - generic [ref=e5]:
+        - heading "LiveFlow" [level=1] [ref=e6]
+        - paragraph [ref=e7]: Live lesson copilot with adaptive visual memory
+      - generic [ref=e8]: idle
+    - generic [ref=e10]:
+      - generic [ref=e12]: Camera preview appears here
+      - generic:
+        - generic:
+          - generic:
+            - heading "Generated visual aid" [level=2]
+            - paragraph: Ready
+          - generic [ref=e13]:
+            - button "Lock" [ref=e14] [cursor=pointer]
+            - button "Wide" [ref=e15] [cursor=pointer]
+            - button "Generate" [ref=e16] [cursor=pointer]
+        - generic:
+          - generic: Waiting for the first visual
+        - generic:
+          - generic:
+            - generic: Lesson memory
+            - strong: Listening for the next teaching unit
+          - generic:
+            - generic: Placement
+            - strong: waiting for hands
+          - generic:
+            - generic: Latency
+            - strong: waiting for first run
+        - generic [ref=e18]: No saved visual frames yet
+      - generic [ref=e19]:
+        - generic [ref=e20]:
+          - generic [ref=e21]:
+            - heading "Camera vision analysis" [level=2] [ref=e22]
+            - generic [ref=e23]: waiting for camera
+          - generic [ref=e24]: Start live with Auto on to analyze the live frame, board, hands, and traces.
+        - generic [ref=e25]:
+          - generic [ref=e26]:
+            - heading "Speech context" [level=2] [ref=e27]
+            - generic [ref=e28]:
+              - group "Speech language" [ref=e29]:
+                - button "English" [pressed] [ref=e30] [cursor=pointer]
+                - button "Chinese" [ref=e31] [cursor=pointer]
+              - generic [ref=e32]: English · idle
+              - button "Clear context" [ref=e33] [cursor=pointer]
+          - textbox "Start live in English, or type lesson context here..." [ref=e34]
+      - toolbar "Live teaching controls" [ref=e35]:
+        - generic [ref=e36]:
+          - button "Start live" [ref=e37] [cursor=pointer]
+          - generic [ref=e38]:
+            - checkbox "Auto" [checked] [ref=e39]
+            - generic [ref=e40]: Auto
+        - generic [ref=e41]:
+          - generic [ref=e42]:
+            - button "Continuous" [ref=e43] [cursor=pointer]
+            - button "2 hands" [ref=e44] [cursor=pointer]
+          - generic [ref=e45]:
+            - button "Flux" [ref=e46] [cursor=pointer]
+            - button "GPT Image 2" [ref=e47] [cursor=pointer]
+            - button "Mermaid" [ref=e48] [cursor=pointer]
+          - generic [ref=e49]:
+            - button "diagram" [ref=e50] [cursor=pointer]
+            - button "metaphor" [ref=e51] [cursor=pointer]
+            - button "steps" [ref=e52] [cursor=pointer]
+        - generic [ref=e53]:
+          - button "Trace" [ref=e54] [cursor=pointer]
+          - button "Commit" [ref=e55] [cursor=pointer]
+          - button "Visual" [ref=e56] [cursor=pointer]
+          - button "Clear" [ref=e57] [cursor=pointer]
+  - complementary [ref=e58]:
+    - generic [ref=e59]:
+      - generic [ref=e60]:
+        - heading "Gesture events" [level=2] [ref=e61]
+        - list [ref=e62]:
+          - listitem [ref=e63]: No gestures yet
+      - generic [ref=e64]:
+        - heading "Trace memory" [level=2] [ref=e65]
+        - list [ref=e66]:
+          - listitem [ref=e67]: Commit a trace to store it
+    - generic [ref=e68]:
+      - heading "Generation queue" [level=2] [ref=e70]
+      - generic [ref=e71]: Parallel visual updates will appear here.
+    - generic [ref=e72]:
+      - heading "Last visual prompt" [level=2] [ref=e74]
+      - generic [ref=e75]: A generated prompt will appear after the first image request.
+    - generic [ref=e76]:
+      - generic [ref=e77]:
+        - heading "Camera diagnostics" [level=2] [ref=e78]
+        - generic [ref=e79]: secure
+      - generic [ref=e80]: Click Start live to run diagnostics.
