@@ -1126,66 +1126,69 @@ function App() {
           <canvas ref={canvasRef} />
           {!cameraOn && <div className="camera-empty">Camera preview appears here</div>}
           {!betaReady && (
-            <section className="access-gate" role="dialog" aria-labelledby="access-title">
-              <div className="access-header">
-                <span>Public beta setup</span>
-                <h2 id="access-title">Get LiveFlow ready</h2>
-                <p>LiveFlow uses your camera, microphone, transcript, prompt, and frame context to generate lesson visuals.</p>
-              </div>
+            <>
+              <div className="setup-backdrop" aria-hidden="true" />
+              <section className="access-gate" role="dialog" aria-labelledby="access-title" aria-modal="true">
+                <div className="access-header">
+                  <span>Public beta setup</span>
+                  <h2 id="access-title">Get LiveFlow ready</h2>
+                  <p>LiveFlow uses your camera, microphone, transcript, prompt, and frame context to generate lesson visuals.</p>
+                </div>
 
-              <ol className="access-steps" aria-label="Setup steps">
-                <li className={betaStatus.authenticated ? "complete" : "active"}>
-                  <span>1</span>
-                  <div>
-                    <strong>Enter beta</strong>
-                    <small>{betaStatus.authenticated ? "Access confirmed" : "Use your invite code"}</small>
-                  </div>
-                </li>
-                <li className={betaStatus.authenticated && !privacyAccepted ? "active" : betaReady ? "complete" : ""}>
-                  <span>2</span>
-                  <div>
-                    <strong>Review consent</strong>
-                    <small>Confirm provider processing</small>
-                  </div>
-                </li>
-                <li>
-                  <span>3</span>
-                  <div>
-                    <strong>Start live</strong>
-                    <small>Begin camera and speech capture</small>
-                  </div>
-                </li>
-              </ol>
+                <ol className="access-steps" aria-label="Setup steps">
+                  <li className={betaStatus.authenticated ? "complete" : "active"}>
+                    <span>1</span>
+                    <div>
+                      <strong>Enter beta</strong>
+                      <small>{betaStatus.authenticated ? "Access confirmed" : "Use your invite code"}</small>
+                    </div>
+                  </li>
+                  <li className={betaStatus.authenticated && !privacyAccepted ? "active" : betaReady ? "complete" : ""}>
+                    <span>2</span>
+                    <div>
+                      <strong>Review consent</strong>
+                      <small>Confirm provider processing</small>
+                    </div>
+                  </li>
+                  <li>
+                    <span>3</span>
+                    <div>
+                      <strong>Start live</strong>
+                      <small>Begin camera and speech capture</small>
+                    </div>
+                  </li>
+                </ol>
 
-              {!betaStatus.authenticated && (
-                <form onSubmit={submitBetaAccess} className="access-form">
-                  <input
-                    value={accessCode}
-                    onChange={(event) => setAccessCode(event.target.value)}
-                    placeholder="Invite code"
-                    autoComplete="off"
-                  />
-                  <button className="primary" type="submit" disabled={betaStatus.loading || !accessCode.trim()}>
-                    Enter
-                  </button>
-                </form>
-              )}
+                {!betaStatus.authenticated && (
+                  <form onSubmit={submitBetaAccess} className="access-form">
+                    <input
+                      value={accessCode}
+                      onChange={(event) => setAccessCode(event.target.value)}
+                      placeholder="Invite code"
+                      autoComplete="off"
+                    />
+                    <button className="primary" type="submit" disabled={betaStatus.loading || !accessCode.trim()}>
+                      Enter
+                    </button>
+                  </form>
+                )}
 
-              {betaStatus.authenticated && (
-                <label className="consent-check">
-                  <input type="checkbox" checked={privacyAccepted} onChange={(event) => setPrivacyAccepted(event.target.checked)} />
-                  <span>
-                    <strong>Allow beta provider processing</strong>
-                    <small>I understand lesson context may be sent to configured AI providers while using this beta.</small>
-                  </span>
-                </label>
-              )}
+                {betaStatus.authenticated && (
+                  <label className="consent-check">
+                    <input type="checkbox" checked={privacyAccepted} onChange={(event) => setPrivacyAccepted(event.target.checked)} />
+                    <span>
+                      <strong>Allow beta provider processing</strong>
+                      <small>I understand lesson context may be sent to configured AI providers while using this beta.</small>
+                    </span>
+                  </label>
+                )}
 
-              <div className="access-meta">
-                {accessError ? <span className="inline-error">{accessError}</span> : <span>Report issues: {betaReportContact}</span>}
-                {betaStatus.authenticated && <button onClick={logoutBetaAccess}>Logout</button>}
-              </div>
-            </section>
+                <div className="access-meta">
+                  {accessError ? <span className="inline-error">{accessError}</span> : <span>Report issues: {betaReportContact}</span>}
+                  {betaStatus.authenticated && <button onClick={logoutBetaAccess}>Logout</button>}
+                </div>
+              </section>
+            </>
           )}
 
           {!overlayHidden && (

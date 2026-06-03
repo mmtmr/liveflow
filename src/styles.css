@@ -438,14 +438,13 @@ h2 {
 .lecture-controls {
   position: absolute;
   z-index: 6;
-  left: 50%;
+  left: 16px;
   bottom: 18px;
-  transform: translateX(-50%);
   display: flex;
   align-items: center;
   justify-content: center;
   gap: 8px;
-  max-width: calc(100vw - 32px);
+  max-width: calc(100vw - 176px);
   padding: 8px;
   border: 1px solid rgba(255, 255, 255, 0.12);
   border-radius: 14px;
@@ -456,9 +455,9 @@ h2 {
 
 .version-hint {
   position: absolute;
-  z-index: 7;
+  z-index: 9;
   right: 14px;
-  bottom: 82px;
+  bottom: 14px;
   padding: 4px 7px;
   border: 1px solid rgba(255, 255, 255, 0.1);
   border-radius: 999px;
@@ -707,6 +706,17 @@ h2 {
   backdrop-filter: blur(18px);
 }
 
+.setup-backdrop {
+  position: absolute;
+  z-index: 8;
+  inset: 0;
+  background:
+    radial-gradient(circle at 50% 44%, rgba(8, 12, 16, 0.18), rgba(3, 5, 7, 0.76) 68%),
+    rgba(3, 5, 7, 0.52);
+  backdrop-filter: blur(7px) saturate(0.82);
+  pointer-events: auto;
+}
+
 .inline-error {
   margin-top: 10px;
   color: #ffc3c3;
@@ -895,6 +905,7 @@ h2 {
 
   .lecture-controls {
     flex-wrap: wrap;
+    max-width: calc(100vw - 32px);
   }
 
   .dock-modes {
@@ -945,6 +956,10 @@ h2 {
     margin-top: 0;
     margin-left: auto;
     width: fit-content;
+  }
+
+  .setup-backdrop {
+    position: fixed;
   }
 
   .generated-frame {
