@@ -19,6 +19,12 @@ const VOICE_LANGUAGE_OPTIONS = [
   { value: "en", label: "English" },
   { value: "zh", label: "Chinese" }
 ];
+const IMAGE_PROVIDER_OPTIONS = [
+  { value: "fal", label: "Flux" },
+  { value: "openai", label: "GPT Image 2" },
+  { value: "mermaid", label: "Mermaid" }
+];
+const DEFAULT_IMAGE_PROVIDERS = ["openai", "mermaid"];
 
 const MERMAID_CONFIG = {
   startOnLoad: false,
@@ -236,11 +242,12 @@ function getRealtimeTranscript(event) {
     .trim();
 }
 
-function useRealtimeVoice() {
+function useRealtimeVoice(apiFetch = fetch) {
   const peerRef = useRef(null);
   const dataChannelRef = useRef(null);
   const micStreamRef = useRef(null);
   const reconnectTimerRef = useRef(0);
+  const maxSessionTimerRef = useRef(0);
   const startingRef = useRef(false);
   const shouldListenRef = useRef(false);
   const sessionRef = useRef(0);
@@ -268,7 +275,9 @@ function useRealtimeVoice() {
 
   const stopConnection = useCallback(({ resetStatus = true } = {}) => {
     window.clearTimeout(reconnectTimerRef.current);
+    window.clearTimeout(maxSessionTimerRef.current);
     reconnectTimerRef.current = 0;
+    maxSessionTimerRef.current = 0;
     shouldListenRef.current = false;
     reconnectAttemptsRef.current = 0;
     sessionRef.current += 1;
@@ -373,10 +382,23 @@ function useRealtimeVoice() {
     };
 
     try {
-      const tokenResponse = await fetch(`/api/realtime-token?language=${encodeURIComponent(selectedLanguage)}`);
+      const tokenResponse = await apiFetch("/api/realtime-token", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ language: selectedLanguage })
+      });
       const tokenPayload = await readApiPayload(tokenResponse);
       if (!tokenResponse.ok || !tokenPayload.value) {
         throw new Error(getPayloadError(tokenPayload, "Could not create a Realtime session token."));
+      }
+      if (Number.isFinite(Number(tokenPayload.maxSessionMinutes)) && Number(tokenPayload.maxSessionMinutes) > 0) {
+        window.clearTimeout(maxSessionTimerRef.current);
+        maxSessionTimerRef.current = window.setTimeout(() => {
+          if (sessionId !== sessionRef.current) return;
+          stopConnection({ resetStatus: false });
+          setVoiceStatus("session expired");
+          setVoiceError("Realtime session reached the beta time limit. Start live again to renew within quota.");
+        }, Number(tokenPayload.maxSessionMinutes) * 60 * 1000);
       }
 
       const peer = new RTCPeerConnection();
@@ -476,7 +498,7 @@ function useRealtimeVoice() {
     } finally {
       startingRef.current = false;
     }
-  }, [handleRealtimeEvent, stopConnection]);
+  }, [apiFetch, handleRealtimeEvent, stopConnection]);
 
   useEffect(() => stopConnection, [stopConnection]);
 
@@ -506,7 +528,32 @@ function App() {
   const handTriggerCueTimeoutRef = useRef(0);
   const contextEpochRef = useRef(0);
 
-  const { supported, listening, transcript, speechContext, setTranscript, setSpeechContext, start, stop, voiceStatus, voiceError } = useRealtimeVoice();
+  const [betaStatus, setBetaStatus] = useState({
+    loading: true,
+    authenticated: false,
+    csrfToken: "",
+    expiresAt: "",
+    reportContact: "",
+    enabledImageProviders: DEFAULT_IMAGE_PROVIDERS
+  });
+  const [accessCode, setAccessCode] = useState("");
+  const [accessError, setAccessError] = useState("");
+  const [privacyAccepted, setPrivacyAccepted] = useState(false);
+  const betaReady = betaStatus.authenticated && privacyAccepted;
+  const betaReportContact = betaStatus.reportContact || "Set PUBLIC_BETA_REPORT_CONTACT before public beta";
+  const apiFetch = useCallback((url, options = {}) => {
+    const headers = new Headers(options.headers || {});
+    if (betaStatus.csrfToken) {
+      headers.set("X-CSRF-Token", betaStatus.csrfToken);
+    }
+    return fetch(url, {
+      ...options,
+      credentials: "include",
+      headers
+    });
+  }, [betaStatus.csrfToken]);
+
+  const { supported, listening, transcript, speechContext, setTranscript, setSpeechContext, start, stop, voiceStatus, voiceError } = useRealtimeVoice(apiFetch);
   const [cameraOn, setCameraOn] = useState(false);
   const [trackingState, setTrackingState] = useState("idle");
   const [gestureEvents, setGestureEvents] = useState([]);
@@ -538,10 +585,71 @@ function App() {
 
   const voiceLanguageLabel = getVoiceLanguageOption(voiceLanguage).label;
   const [handTriggerCue, setHandTriggerCue] = useState(null);
+  const enabledProviderOptions = useMemo(() => {
+    const enabled = new Set(betaStatus.enabledImageProviders || DEFAULT_IMAGE_PROVIDERS);
+    const options = IMAGE_PROVIDER_OPTIONS.filter((option) => enabled.has(option.value));
+    return options.length ? options : IMAGE_PROVIDER_OPTIONS.filter((option) => DEFAULT_IMAGE_PROVIDERS.includes(option.value));
+  }, [betaStatus.enabledImageProviders]);
+
+  useEffect(() => {
+    if (!enabledProviderOptions.some((option) => option.value === imageProvider)) {
+      setImageProvider(enabledProviderOptions[0]?.value || "openai");
+    }
+  }, [enabledProviderOptions, imageProvider]);
 
   const logDiagnostic = useCallback((message) => {
     setDiagnostics((items) => [`${nowTime()} ${message}`, ...items].slice(0, 6));
   }, []);
+
+  const refreshBetaSession = useCallback(async () => {
+    try {
+      const response = await fetch("/api/beta/session", { credentials: "include" });
+      const payload = await readApiPayload(response);
+      if (!response.ok) throw new Error(getPayloadError(payload, "Could not read beta session."));
+      setBetaStatus({
+        loading: false,
+        authenticated: Boolean(payload.authenticated),
+        csrfToken: payload.csrfToken || "",
+        expiresAt: payload.expiresAt || "",
+        reportContact: payload.reportContact || "",
+        enabledImageProviders: payload.enabledImageProviders || DEFAULT_IMAGE_PROVIDERS
+      });
+    } catch (sessionError) {
+      setBetaStatus((value) => ({ ...value, loading: false, authenticated: false, csrfToken: "" }));
+      setAccessError(sessionError instanceof Error ? sessionError.message : "Could not read beta session.");
+    }
+  }, []);
+
+  useEffect(() => {
+    refreshBetaSession();
+  }, [refreshBetaSession]);
+
+  const submitBetaAccess = useCallback(async (event) => {
+    event.preventDefault();
+    setAccessError("");
+    try {
+      const response = await fetch("/api/beta/access", {
+        method: "POST",
+        credentials: "include",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ code: accessCode })
+      });
+      const payload = await readApiPayload(response);
+      if (!response.ok) throw new Error(getPayloadError(payload, "Beta access failed."));
+      setBetaStatus((value) => ({
+        ...value,
+        loading: false,
+        authenticated: true,
+        csrfToken: payload.csrfToken || "",
+        expiresAt: payload.expiresAt || value.expiresAt,
+        enabledImageProviders: payload.enabledImageProviders || value.enabledImageProviders || DEFAULT_IMAGE_PROVIDERS
+      }));
+      setAccessCode("");
+      setStatus("Beta access active");
+    } catch (accessFailure) {
+      setAccessError(accessFailure instanceof Error ? accessFailure.message : "Beta access failed.");
+    }
+  }, [accessCode]);
 
   const latestContext = useMemo(
     () => ({
@@ -611,6 +719,11 @@ function App() {
   }, []);
 
   const generateImage = useCallback(async ({ force = true, reason = "manual" } = {}) => {
+    if (!betaReady) {
+      setStatus("Beta access and privacy consent required");
+      return;
+    }
+
     if (visualLocked && !force) {
       setStatus("Visual locked");
       return;
@@ -647,7 +760,7 @@ function App() {
     setStatus(imageRef.current ? `Updating in background (${inFlightGenerationCountRef.current})` : "Instant sketch ready, generating polished visual...");
 
     try {
-      const response = await fetch("/api/generate", {
+      const response = await apiFetch("/api/generate", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(requestContext)
@@ -711,7 +824,7 @@ function App() {
       inFlightGenerationCountRef.current = Math.max(0, inFlightGenerationCountRef.current - 1);
       setPendingGenerations(inFlightGenerationCountRef.current);
     }
-  }, [latestContext, mode, updateImage, visualLocked]);
+  }, [apiFetch, betaReady, latestContext, mode, updateImage, visualLocked]);
 
   const captureFrame = useCallback(() => {
     return captureCanvasFrame(canvasRef.current);
@@ -728,7 +841,7 @@ function App() {
 
     try {
       const liveStrokes = summarizeLiveStrokes(strokeRef.current);
-      const response = await fetch("/api/analyze-frame", {
+      const response = await apiFetch("/api/analyze-frame", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -758,10 +871,15 @@ function App() {
     } finally {
       analyzingRef.current = false;
     }
-  }, [autoGenerate, cameraOn, captureFrame, generateImage, generationTriggerMode, gestureEvents, strokes, transcript]);
+  }, [apiFetch, autoGenerate, cameraOn, captureFrame, generateImage, generationTriggerMode, gestureEvents, strokes, transcript]);
 
   const startCamera = useCallback(async () => {
     setError("");
+    if (!betaReady) {
+      setStatus("Beta access and privacy consent required");
+      setTrackingState("idle");
+      return;
+    }
     setTrackingState("requesting camera");
     logDiagnostic(`secureContext=${window.isSecureContext} mediaDevices=${Boolean(navigator.mediaDevices)}`);
 
@@ -814,7 +932,7 @@ function App() {
       logDiagnostic(message);
       setError(message);
     }
-  }, [logDiagnostic]);
+  }, [betaReady, logDiagnostic]);
 
   const stopCamera = useCallback(() => {
     cancelAnimationFrame(rafRef.current);
@@ -826,19 +944,31 @@ function App() {
 
   const startLiveSession = useCallback(async () => {
     setError("");
+    if (!betaReady) {
+      setStatus("Beta access and privacy consent required");
+      return;
+    }
     setStatus("Starting camera and realtime...");
     await Promise.all([
       startCamera(),
       supported && !listening ? start(voiceLanguage) : Promise.resolve()
     ]);
     setStatus("Live session running");
-  }, [listening, start, startCamera, supported, voiceLanguage]);
+  }, [betaReady, listening, start, startCamera, supported, voiceLanguage]);
 
   const stopLiveSession = useCallback(() => {
     stopCamera();
     stop();
     setStatus("Live session stopped");
   }, [stop, stopCamera]);
+
+  const logoutBetaAccess = useCallback(async () => {
+    await apiFetch("/api/beta/logout", { method: "POST" });
+    stopLiveSession();
+    setPrivacyAccepted(false);
+    setBetaStatus((value) => ({ ...value, authenticated: false, csrfToken: "", expiresAt: "" }));
+    setStatus("Beta access cleared");
+  }, [apiFetch, stopLiveSession]);
 
   const changeVoiceLanguage = useCallback(async (nextLanguage) => {
     if (nextLanguage === voiceLanguage) return;
@@ -1063,6 +1193,41 @@ function App() {
             </div>
           )}
 
+          {!betaReady && (
+            <section className="access-gate" role="dialog" aria-labelledby="access-title">
+              <div>
+                <h2 id="access-title">Public beta access</h2>
+                <p>Camera, microphone, transcript, prompt, and frame context may be sent to configured AI providers during this beta.</p>
+              </div>
+
+              {!betaStatus.authenticated && (
+                <form onSubmit={submitBetaAccess} className="access-form">
+                  <input
+                    value={accessCode}
+                    onChange={(event) => setAccessCode(event.target.value)}
+                    placeholder="Invite code"
+                    autoComplete="off"
+                  />
+                  <button className="primary" type="submit" disabled={betaStatus.loading || !accessCode.trim()}>
+                    Enter
+                  </button>
+                </form>
+              )}
+
+              {betaStatus.authenticated && (
+                <label className="consent-check">
+                  <input type="checkbox" checked={privacyAccepted} onChange={(event) => setPrivacyAccepted(event.target.checked)} />
+                  <span>I understand and consent to beta provider processing.</span>
+                </label>
+              )}
+
+              <div className="access-meta">
+                {accessError ? <span className="inline-error">{accessError}</span> : <span>Report issues: {betaReportContact}</span>}
+                {betaStatus.authenticated && <button onClick={logoutBetaAccess}>Logout</button>}
+              </div>
+            </section>
+          )}
+
           {!overlayHidden && (
             <section className={`visual-stage side-${overlaySide} ${overlayExpanded ? "expanded" : ""} ${pendingGenerations ? "is-generating" : ""}`}>
               <div className="visual-header">
@@ -1073,7 +1238,7 @@ function App() {
                 <div className="visual-actions">
                   <button onClick={() => setVisualLocked((value) => !value)}>{visualLocked ? "Unlock" : "Lock"}</button>
                   <button onClick={() => setOverlayExpanded((value) => !value)}>{overlayExpanded ? "Fit" : "Wide"}</button>
-                  <button className="primary" onClick={generateImage} disabled={pendingGenerations >= MAX_PARALLEL_GENERATIONS}>Generate</button>
+                  <button className="primary" onClick={generateImage} disabled={!betaReady || pendingGenerations >= MAX_PARALLEL_GENERATIONS}>Generate</button>
                 </div>
               </div>
               <div className="generated-frame">
@@ -1153,7 +1318,7 @@ function App() {
 
           <div className="lecture-controls" role="toolbar" aria-label="Live teaching controls">
             <div className="dock-group dock-session">
-              <button className="dock-primary" onClick={cameraOn || listening ? stopLiveSession : startLiveSession}>
+              <button className="dock-primary" onClick={cameraOn || listening ? stopLiveSession : startLiveSession} disabled={!betaReady && !cameraOn && !listening}>
                 {cameraOn || listening ? "Stop live" : "Start live"}
               </button>
               <label className="switch">
@@ -1174,13 +1339,9 @@ function App() {
                 ))}
               </div>
               <div className="segmented provider-mode">
-                {[
-                  ["fal", "Flux"],
-                  ["openai", "GPT Image 2"],
-                  ["mermaid", "Mermaid"]
-                ].map(([value, label]) => (
-                  <button key={value} className={imageProvider === value ? "selected" : ""} onClick={() => setImageProvider(value)}>
-                    {label}
+                {enabledProviderOptions.map((option) => (
+                  <button key={option.value} className={imageProvider === option.value ? "selected" : ""} onClick={() => setImageProvider(option.value)}>
+                    {option.label}
                   </button>
                 ))}
               </div>

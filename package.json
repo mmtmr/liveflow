@@ -10,6 +10,8 @@
     "dev:web:local": "VITE_HTTPS=false vite --host 127.0.0.1 --port 5174",
     "dev:local": "concurrently \"npm:dev:api\" \"npm:dev:web:local\"",
     "build": "vite build",
+    "start": "NODE_ENV=production node server/index.mjs",
+    "test:smoke": "node scripts/smoke-api.mjs",
     "preview": "vite preview --host 0.0.0.0"
   },
   "dependencies": {
