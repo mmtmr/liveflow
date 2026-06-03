@@ -426,11 +426,22 @@ function requestOrigin(req) {
   return `${req.protocol}://${req.get("host")}`;
 }
 
-function allowedOrigins(req) {
-  const configuredOrigins = String(process.env.PUBLIC_BASE_URL || "")
+function configuredPublicBaseOrigins() {
+  return String(process.env.PUBLIC_BASE_URL || "")
     .split(",")
     .map((origin) => origin.trim())
-    .filter(Boolean);
+    .filter(Boolean)
+    .map((origin) => {
+      try {
+        return new URL(origin).origin;
+      } catch {
+        return origin;
+      }
+    });
+}
+
+function allowedOrigins(req) {
+  const configuredOrigins = configuredPublicBaseOrigins();
   return new Set(isProduction && configuredOrigins.length ? configuredOrigins : [requestOrigin(req), ...configuredOrigins]);
 }
 
@@ -553,14 +564,39 @@ function buildImagePrompt({ transcript, recentTranscript, gestures, strokes, mod
   ].join("\n");
 }
 
+function compactErrorText(value) {
+  return String(value || "").replace(/\s+/g, " ").trim();
+}
+
+function looksLikeHtml(value) {
+  return /<!doctype|<html|<\/[a-z][\s\S]*>/i.test(String(value || ""));
+}
+
+function normalizeProviderError(message, fallback = "Image generation failed.") {
+  const text = compactErrorText(message);
+  if (!text) return fallback;
+  if (/operation aborted|aborterror|aborted|timed out|timeout/i.test(text)) {
+    return "The provider request took too long and was stopped. Try again in a moment.";
+  }
+  if (/520|web server is returning an unknown error|cloudflare/i.test(text) || looksLikeHtml(text)) {
+    return "The provider returned a temporary server error. Try again in a moment.";
+  }
+  if (/failed to fetch|networkerror|network request failed|load failed/i.test(text)) {
+    return "The provider network connection was interrupted. Try again in a moment.";
+  }
+  return text.length > 220 ? `${text.slice(0, 217)}...` : text;
+}
+
 function sanitizeOpenAIError(message) {
-  return String(message || "Image generation failed.").replace(/sk-[A-Za-z0-9_*.-]+/g, "[redacted-api-key]");
+  const redacted = String(message || "Image generation failed.").replace(/sk-[A-Za-z0-9_*.-]+/g, "[redacted-api-key]");
+  return normalizeProviderError(redacted);
 }
 
 function sanitizeFalError(message) {
-  return String(message || "Image generation failed.")
+  const redacted = String(message || "Image generation failed.")
     .replace(/Key\s+[A-Za-z0-9_*.:/-]+/g, "Key [redacted-api-key]")
     .replace(/fal_[A-Za-z0-9_*.-]+/g, "[redacted-api-key]");
+  return normalizeProviderError(redacted);
 }
 
 async function readResponsePayload(response) {
@@ -572,8 +608,9 @@ async function readResponsePayload(response) {
   } catch {
     return {
       error: {
-        message: text.slice(0, 500)
-      }
+        message: normalizeProviderError(text, response.statusText || "Provider returned an unreadable response.")
+      },
+      details: text.slice(0, 500)
     };
   }
 }

@@ -91,7 +91,7 @@ function startAppServer(providerBaseUrl, envOverrides = {}) {
       OPENAI_RESPONSES_URL: `${providerBaseUrl}/responses`,
       ALLOW_PROVIDER_ENDPOINT_OVERRIDES: "true",
       PROVIDER_TIMEOUT_MS: "50",
-      PUBLIC_BASE_URL: origin,
+      PUBLIC_BASE_URL: `${origin}/`,
       TRUST_PROXY: "false",
       ...envOverrides
     },

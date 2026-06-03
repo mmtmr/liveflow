@@ -329,6 +329,10 @@ h2 {
   background: #11171d;
 }
 
+.visual-stage.show-details .generated-frame {
+  aspect-ratio: 16 / 9;
+}
+
 .generated-frame img {
   width: 100%;
   height: 100%;
@@ -348,7 +352,7 @@ h2 {
 .generation-badge {
   position: absolute;
   right: 12px;
-  bottom: 12px;
+  top: 12px;
   border: 1px solid rgba(241, 196, 90, 0.5);
   border-radius: 999px;
   background: rgba(8, 12, 16, 0.78);
@@ -357,6 +361,44 @@ h2 {
   font-size: 0.8rem;
   font-weight: 700;
   backdrop-filter: blur(12px);
+}
+
+.generation-eta {
+  position: absolute;
+  left: 12px;
+  top: 12px;
+  display: grid;
+  gap: 2px;
+  max-width: min(260px, calc(100% - 24px));
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  border-radius: 8px;
+  background: rgba(8, 12, 16, 0.78);
+  color: #dce6ec;
+  padding: 8px 10px;
+  font-size: 0.76rem;
+  line-height: 1.25;
+  backdrop-filter: blur(12px);
+}
+
+.generation-eta.is-running {
+  border-color: rgba(241, 196, 90, 0.5);
+  color: #ffe3a2;
+}
+
+.generation-eta strong,
+.generation-eta span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.generation-eta strong {
+  font-size: 0.8rem;
+}
+
+.generation-eta span {
+  color: #9aa6af;
+  font-size: 0.7rem;
 }
 
 .visual-intel {
@@ -441,8 +483,9 @@ h2 {
   left: 16px;
   bottom: 18px;
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
-  justify-content: center;
+  justify-content: flex-start;
   gap: 8px;
   max-width: calc(100vw - 176px);
   padding: 8px;
@@ -631,15 +674,15 @@ h2 {
 .debug-drawer {
   position: absolute;
   z-index: 3;
-  right: 16px;
-  bottom: 92px;
-  width: min(44vw, 680px);
-  max-height: 28vh;
+  top: 96px;
+  left: 16px;
+  width: min(42vw, 560px);
+  max-height: min(36vh, 260px);
   overflow: auto;
   display: grid;
   gap: 10px;
-  opacity: 0.16;
-  transition: opacity 160ms ease;
+  opacity: 1;
+  transition: opacity 160ms ease, transform 160ms ease;
   pointer-events: auto;
 }
 

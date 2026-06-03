@@ -1,6 +1,6 @@
 {
   "name": "mp-image-assistance",
-  "version": "0.1.2",
+  "version": "0.1.5",
   "private": true,
   "type": "module",
   "scripts": {
