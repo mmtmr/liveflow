@@ -22,6 +22,8 @@ const providerTimeoutMs = numberFromEnv("PROVIDER_TIMEOUT_MS", 30000);
 const falImageModel = process.env.FAL_IMAGE_MODEL || "fal-ai/flux/schnell";
 const falImageEndpoint = `https://fal.run/${falImageModel}`;
 const openAIImageModel = process.env.OPENAI_IMAGE_MODEL || "gpt-image-2";
+const openAIImageMinTranscriptWords = numberFromEnv("GPT_IMAGE_MIN_TRANSCRIPT_WORDS", 12);
+const openAIImageLockTtlMs = Math.max(providerTimeoutMs * 2, 60000);
 const mermaidModel = process.env.OPENAI_MERMAID_MODEL || process.env.OPENAI_VISION_MODEL || "gpt-4.1-mini";
 const openAIResponsesEndpoint = process.env.OPENAI_RESPONSES_URL || "https://api.openai.com/v1/responses";
 const openAIImagesEndpoint = process.env.OPENAI_IMAGES_URL || "https://api.openai.com/v1/images/generations";
@@ -65,6 +67,7 @@ const positiveProductionNumberEnv = [
   "BETA_FRAME_ANALYSES_PER_IP_PER_HOUR"
 ];
 const quotaStore = new Map();
+const openAIImageInFlight = new Map();
 
 function missingProductionConfig() {
   const missing = requiredProductionEnv.filter((name) => !process.env[name]);
@@ -515,6 +518,53 @@ function extractResponseText(payload) {
 
 function compactText(value) {
   return String(value || "").replace(/\s+/g, " ").trim();
+}
+
+function transcriptWordCount(value) {
+  return compactText(value).split(" ").filter(Boolean).length;
+}
+
+function getOpenAIImageContextStatus(requestContext) {
+  const speech = compactText(requestContext.recentTranscript) || compactText(requestContext.transcript);
+  const words = transcriptWordCount(speech);
+  return {
+    words,
+    required: openAIImageMinTranscriptWords,
+    ready: words >= openAIImageMinTranscriptWords,
+    remaining: Math.max(0, openAIImageMinTranscriptWords - words)
+  };
+}
+
+function pruneOpenAIImageLocks(now = Date.now()) {
+  for (const [key, lock] of openAIImageInFlight.entries()) {
+    if (!lock || now - lock.startedAt > openAIImageLockTtlMs) openAIImageInFlight.delete(key);
+  }
+}
+
+function openAIImageLockKey(req) {
+  return req.betaSession?.sid ? `session:${req.betaSession.sid}` : `ip:${req.ip || "unknown"}`;
+}
+
+function acquireOpenAIImageLock(req) {
+  const now = Date.now();
+  pruneOpenAIImageLocks(now);
+  const key = openAIImageLockKey(req);
+  const existing = openAIImageInFlight.get(key);
+  if (existing) {
+    return {
+      ok: false,
+      key,
+      retryAfterSeconds: Math.max(1, Math.ceil((openAIImageLockTtlMs - (now - existing.startedAt)) / 1000))
+    };
+  }
+  const token = randomUUID();
+  openAIImageInFlight.set(key, { token, startedAt: now });
+  return { ok: true, key, token };
+}
+
+function releaseOpenAIImageLock(key, token) {
+  const existing = openAIImageInFlight.get(key);
+  if (existing?.token === token) openAIImageInFlight.delete(key);
 }
 
 function buildImagePrompt({ transcript, recentTranscript, gestures, strokes, mode, visualAnalysis, generationAnalysis, previousBrief, visualHistory }) {
@@ -1321,19 +1371,41 @@ app.post("/api/analyze-frame", requireSameOrigin, requireBetaSession, requireCsr
 app.post("/api/generate", requireSameOrigin, requireBetaSession, requireCsrfToken, async (req, res) => {
   const startedAt = Date.now();
   let requestContext;
+  let openAIImageLock;
   try {
     requestContext = sanitizeContextPayload(req.body);
   } catch (error) {
     return jsonError(req, res, 400, error instanceof Error ? error.message : "Invalid generation payload.");
   }
 
+  const imageProvider = getImageProvider(requestContext.imageProvider);
+  if (imageProvider === "openai") {
+    const contextStatus = getOpenAIImageContextStatus(requestContext);
+    if (!contextStatus.ready) {
+      return jsonError(req, res, 422, `GPT Image 2 needs at least ${contextStatus.required} transcript words before generating.`, {
+        words: contextStatus.words,
+        required: contextStatus.required,
+        remaining: contextStatus.remaining
+      });
+    }
+
+    openAIImageLock = acquireOpenAIImageLock(req);
+    if (!openAIImageLock.ok) {
+      return jsonError(req, res, 409, "GPT Image 2 is already generating for this beta session.", {
+        retryAfterSeconds: openAIImageLock.retryAfterSeconds
+      });
+    }
+  }
+
   let quotaPassed = false;
   enforceQuota(req, res, () => {
     quotaPassed = true;
   }, "generation");
-  if (!quotaPassed) return;
+  if (!quotaPassed) {
+    if (openAIImageLock?.ok) releaseOpenAIImageLock(openAIImageLock.key, openAIImageLock.token);
+    return;
+  }
 
-  const imageProvider = getImageProvider(requestContext.imageProvider);
   req.providerLabel = imageProvider === "mermaid" ? "Mermaid" : imageProvider === "openai" ? "OpenAI" : "fal.ai";
   req.providerModel = imageProvider === "mermaid" ? mermaidModel : imageProvider === "openai" ? openAIImageModel : falImageModel;
   let generationFrame = { analysis: "", durationMs: 0 };
@@ -1375,6 +1447,8 @@ app.post("/api/generate", requireSameOrigin, requireBetaSession, requireCsrfToke
         : sanitizeFalError(error instanceof Error ? error.message : "Unexpected server error."),
       createdAt: new Date().toISOString()
     });
+  } finally {
+    if (openAIImageLock?.ok) releaseOpenAIImageLock(openAIImageLock.key, openAIImageLock.token);
   }
 });
 
