@@ -12,6 +12,7 @@ const MAX_STROKES = 8;
 const MAX_VISUAL_HISTORY = 5;
 const GPT_IMAGE_EXPECTED_MS = 10000;
 const GPT_IMAGE_DURATION_HISTORY = 4;
+const GPT_IMAGE_MIN_TRANSCRIPT_WORDS = 12;
 const RECENT_TRANSCRIPT_WORDS = 160;
 const VOICE_CONNECT_TIMEOUT_MS = 15000;
 const VOICE_RECONNECT_DELAY_MS = 900;
@@ -75,6 +76,19 @@ function expectedGptImageMs(durations) {
   if (!usableDurations.length) return GPT_IMAGE_EXPECTED_MS;
   const average = usableDurations.reduce((sum, duration) => sum + duration, 0) / usableDurations.length;
   return Math.max(5000, Math.min(30000, Math.round(average)));
+}
+
+function transcriptWordCount(value) {
+  return String(value || "").replace(/\s+/g, " ").trim().split(" ").filter(Boolean).length;
+}
+
+function getGptImageContextStatus(transcript) {
+  const words = transcriptWordCount(recentWords(transcript, RECENT_TRANSCRIPT_WORDS));
+  return {
+    words,
+    ready: words >= GPT_IMAGE_MIN_TRANSCRIPT_WORDS,
+    remaining: Math.max(0, GPT_IMAGE_MIN_TRANSCRIPT_WORDS - words)
+  };
 }
 
 function summarizeStroke(points, handLabel) {
@@ -571,6 +585,7 @@ function App() {
   const generationSerialRef = useRef(0);
   const displayedGenerationRef = useRef(0);
   const inFlightGenerationCountRef = useRef(0);
+  const gptImageInFlightRef = useRef(false);
   const overlaySideRef = useRef("right");
   const lastOverlayMoveRef = useRef(0);
   const lastHandMetaRef = useRef(0);
@@ -643,12 +658,23 @@ function App() {
     return options.length ? options : IMAGE_PROVIDER_OPTIONS.filter((option) => DEFAULT_IMAGE_PROVIDERS.includes(option.value));
   }, [betaStatus.enabledImageProviders]);
   const expectedGptImageDurationMs = useMemo(() => expectedGptImageMs(gptImageDurations), [gptImageDurations]);
+  const gptImageContextStatus = useMemo(() => getGptImageContextStatus(transcript), [transcript]);
   const generationEtaLabel = generationEta
     ? generationEta.remainingMs > 0
       ? `GPT Image 2 ETA ${formatEtaSeconds(generationEta.remainingMs)}`
       : "GPT Image 2 finalizing"
     : imageProvider === "openai"
-      ? `GPT Image 2 usually takes ${formatEtaSeconds(expectedGptImageDurationMs)}`
+      ? gptImageContextStatus.ready
+        ? `GPT Image 2 usually takes ${formatEtaSeconds(expectedGptImageDurationMs)}`
+        : `GPT Image 2 needs ${gptImageContextStatus.remaining} more transcript word${gptImageContextStatus.remaining === 1 ? "" : "s"}`
+      : "";
+  const generationDisabled = !betaReady
+    || pendingGenerations >= MAX_PARALLEL_GENERATIONS
+    || (imageProvider === "openai" && (!gptImageContextStatus.ready || pendingGenerations > 0));
+  const generationDisabledReason = imageProvider === "openai" && !gptImageContextStatus.ready
+    ? `GPT Image 2 needs at least ${GPT_IMAGE_MIN_TRANSCRIPT_WORDS} transcript words before generating.`
+    : imageProvider === "openai" && pendingGenerations > 0
+      ? "GPT Image 2 is already generating."
       : "";
 
   useEffect(() => {
@@ -790,20 +816,6 @@ function App() {
       return;
     }
 
-    if (inFlightGenerationCountRef.current >= MAX_PARALLEL_GENERATIONS) {
-      setStatus(`Already generating ${MAX_PARALLEL_GENERATIONS} visuals`);
-      return;
-    }
-
-    const generationId = generationSerialRef.current + 1;
-    const contextEpoch = contextEpochRef.current;
-    const generationStartedAt = Date.now();
-    generationSerialRef.current = generationId;
-    inFlightGenerationCountRef.current += 1;
-    setPendingGenerations(inFlightGenerationCountRef.current);
-    setError("");
-    lastGenerationRef.current = generationStartedAt;
-
     const liveStrokes = summarizeLiveStrokes(strokeRef.current);
     const requestContext = {
       ...latestContext,
@@ -811,22 +823,41 @@ function App() {
       frame: captureCanvasFrame(canvasRef.current, 560, 0.68)
     };
     const usingGptImage = requestContext.imageProvider === "openai";
+    if (usingGptImage && !gptImageContextStatus.ready) {
+      const message = `GPT Image 2 needs at least ${GPT_IMAGE_MIN_TRANSCRIPT_WORDS} transcript words before generating. Add ${gptImageContextStatus.remaining} more word${gptImageContextStatus.remaining === 1 ? "" : "s"} so the visual has useful context.`;
+      setStatus(message);
+      setGenerationEta(null);
+      logDiagnostic(`blocked GPT Image 2 generation: only ${gptImageContextStatus.words} transcript words`);
+      return;
+    }
+
+    if (usingGptImage && gptImageInFlightRef.current) {
+      setStatus("GPT Image 2 is still generating. Waiting for the current image before starting another.");
+      logDiagnostic("blocked overlapping GPT Image 2 generation");
+      return;
+    }
+
+    if (inFlightGenerationCountRef.current >= MAX_PARALLEL_GENERATIONS) {
+      setStatus(`Already generating ${MAX_PARALLEL_GENERATIONS} visuals`);
+      return;
+    }
+
+    const generationId = generationSerialRef.current + 1;
+    const contextEpoch = contextEpochRef.current;
+    generationSerialRef.current = generationId;
+    inFlightGenerationCountRef.current += 1;
+    if (usingGptImage) {
+      gptImageInFlightRef.current = true;
+    }
+    setPendingGenerations(inFlightGenerationCountRef.current);
+    setError("");
+
     const expectedDurationMs = expectedGptImageDurationMs;
     const brief = buildVisualBrief(requestContext);
     const preview = makeInstantPreview({ ...requestContext, generationId });
 
     setCurrentBrief(brief);
     setInstantPreview(preview);
-    if (usingGptImage) {
-      setGenerationEta({
-        id: generationId,
-        startedAt: generationStartedAt,
-        expectedMs: expectedDurationMs,
-        remainingMs: expectedDurationMs,
-        elapsedMs: 0,
-        sampleCount: gptImageDurations.length
-      });
-    }
     setGenerationQueue((items) => [
       { id: generationId, reason, brief, time: nowTime(), status: "running", expectedMs: usingGptImage ? expectedDurationMs : null },
       ...items
@@ -836,6 +867,18 @@ function App() {
       : imageRef.current ? `Updating in background (${inFlightGenerationCountRef.current})` : "Instant sketch ready, generating polished visual...");
 
     try {
+      const fetchStartedAt = Date.now();
+      lastGenerationRef.current = fetchStartedAt;
+      if (usingGptImage) {
+        setGenerationEta({
+          id: generationId,
+          startedAt: fetchStartedAt,
+          expectedMs: expectedDurationMs,
+          remainingMs: expectedDurationMs,
+          elapsedMs: 0,
+          sampleCount: gptImageDurations.length
+        });
+      }
       const response = await apiFetch("/api/generate", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -905,9 +948,13 @@ function App() {
       setGenerationQueue((items) => items.map((item) => item.id === generationId ? { ...item, status: "error" } : item));
     } finally {
       inFlightGenerationCountRef.current = Math.max(0, inFlightGenerationCountRef.current - 1);
+      if (usingGptImage) {
+        gptImageInFlightRef.current = false;
+        setGenerationEta((current) => current?.id === generationId ? null : current);
+      }
       setPendingGenerations(inFlightGenerationCountRef.current);
     }
-  }, [apiFetch, betaReady, expectedGptImageDurationMs, gptImageDurations.length, latestContext, logDiagnostic, mode, updateImage, visualLocked]);
+  }, [apiFetch, betaReady, expectedGptImageDurationMs, gptImageContextStatus, gptImageDurations.length, latestContext, logDiagnostic, mode, updateImage, visualLocked]);
 
   const captureFrame = useCallback(() => {
     return captureCanvasFrame(canvasRef.current);
@@ -1188,7 +1235,9 @@ function App() {
   useEffect(() => {
     if (!autoGenerate || visualLocked) return;
     const timer = window.setInterval(() => {
-      const hasContext = transcript.trim().length > 12 || gestureEvents.length > 0 || strokes.length > 0 || visualAnalysis.trim().length > 0;
+      const hasContext = imageProvider === "openai"
+        ? gptImageContextStatus.ready
+        : transcript.trim().length > 12 || gestureEvents.length > 0 || strokes.length > 0 || visualAnalysis.trim().length > 0;
       const contextChanged = contextFingerprint !== lastContextFingerprintRef.current;
       if (hasContext && contextChanged && Date.now() - lastGenerationRef.current > AUTO_INTERVAL_MS - 1000) {
         lastContextFingerprintRef.current = contextFingerprint;
@@ -1197,7 +1246,7 @@ function App() {
     }, 2000);
 
     return () => window.clearInterval(timer);
-  }, [autoGenerate, contextFingerprint, generateImage, gestureEvents.length, strokes.length, transcript, visualAnalysis, visualLocked]);
+  }, [autoGenerate, contextFingerprint, generateImage, gptImageContextStatus.ready, gestureEvents.length, imageProvider, strokes.length, transcript, visualAnalysis, visualLocked]);
 
   useEffect(() => {
     if (!cameraOn || !autoGenerate) return;
@@ -1342,7 +1391,7 @@ function App() {
                 <div className="visual-actions">
                   <button onClick={() => setVisualLocked((value) => !value)}>{visualLocked ? "Unlock" : "Lock"}</button>
                   <button onClick={() => setOverlayExpanded((value) => !value)}>{overlayExpanded ? "Fit" : "Wide"}</button>
-                  <button className="primary" onClick={generateImage} disabled={!betaReady || pendingGenerations >= MAX_PARALLEL_GENERATIONS}>Generate</button>
+                  <button className="primary" onClick={generateImage} disabled={generationDisabled} title={generationDisabledReason}>Generate</button>
                 </div>
               </div>
               <div className="generated-frame">
