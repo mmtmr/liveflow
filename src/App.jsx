@@ -9,12 +9,10 @@ const MAX_EVENTS = 10;
 const MAX_STROKES = 8;
 const MAX_VISUAL_HISTORY = 5;
 const RECENT_TRANSCRIPT_WORDS = 160;
-const HAND_TRIGGER_COOLDOWN_MS = 4800;
 const VOICE_CONNECT_TIMEOUT_MS = 15000;
 const VOICE_RECONNECT_DELAY_MS = 900;
 const MAX_VOICE_RECONNECTS = 2;
 const HAND_TRACE_COLORS = ["#ffcf5a", "#61dafb"];
-const OPEN_HAND_LABELS = new Set(["open_palm", "open palm"]);
 const VOICE_LANGUAGE_OPTIONS = [
   { value: "en", label: "English" },
   { value: "zh", label: "Chinese" }
@@ -102,10 +100,6 @@ function newestFirstTranscript(value) {
 
 function chronologicalTranscript(value) {
   return newestFirstTranscript(value);
-}
-
-function isOpenHandGesture(label) {
-  return OPEN_HAND_LABELS.has(String(label || "").toLowerCase().replace(/-/g, "_"));
 }
 
 function captureCanvasFrame(canvas, maxWidth = 640, quality = 0.72) {
@@ -523,9 +517,6 @@ function App() {
   const lastOverlayMoveRef = useRef(0);
   const lastHandMetaRef = useRef(0);
   const lastContextFingerprintRef = useRef("");
-  const lastHandTriggerRef = useRef(0);
-  const handTriggerArmedRef = useRef(true);
-  const handTriggerCueTimeoutRef = useRef(0);
   const contextEpochRef = useRef(0);
 
   const [betaStatus, setBetaStatus] = useState({
@@ -560,7 +551,6 @@ function App() {
   const [strokes, setStrokes] = useState([]);
   const [isDrawing, setIsDrawing] = useState(true);
   const [autoGenerate, setAutoGenerate] = useState(true);
-  const [generationTriggerMode, setGenerationTriggerMode] = useState("continuous");
   const [imageProvider, setImageProvider] = useState("openai");
   const [mode, setMode] = useState("diagram");
   const [status, setStatus] = useState("Ready");
@@ -584,7 +574,6 @@ function App() {
   const [voiceLanguage, setVoiceLanguage] = useState(VOICE_LANGUAGE_OPTIONS[0].value);
 
   const voiceLanguageLabel = getVoiceLanguageOption(voiceLanguage).label;
-  const [handTriggerCue, setHandTriggerCue] = useState(null);
   const enabledProviderOptions = useMemo(() => {
     const enabled = new Set(betaStatus.enabledImageProviders || DEFAULT_IMAGE_PROVIDERS);
     const options = IMAGE_PROVIDER_OPTIONS.filter((option) => enabled.has(option.value));
@@ -692,25 +681,6 @@ function App() {
         }
       ];
     });
-  }, []);
-
-  const setTriggerMode = useCallback((nextMode) => {
-    handTriggerArmedRef.current = true;
-    lastHandTriggerRef.current = 0;
-    setGenerationTriggerMode(nextMode);
-    setStatus(nextMode === "hands" ? "Show two open hands to generate" : "Continuous generation ready");
-  }, []);
-
-  const flashHandTriggerCue = useCallback(() => {
-    window.clearTimeout(handTriggerCueTimeoutRef.current);
-    setHandTriggerCue({
-      id: Date.now(),
-      title: "Two hands detected",
-      detail: "Generating visual"
-    });
-    handTriggerCueTimeoutRef.current = window.setTimeout(() => {
-      setHandTriggerCue(null);
-    }, 1400);
   }, []);
 
   const updateImage = useCallback((nextImage) => {
@@ -862,7 +832,7 @@ function App() {
         setVisualAnalysis(payload.analysis);
       }
       setAnalysisStatus(`updated ${nowTime()}`);
-      if (autoGenerate && generationTriggerMode === "continuous" && Date.now() - lastGenerationRef.current > 2500) {
+      if (autoGenerate && Date.now() - lastGenerationRef.current > 2500) {
         generateImage({ force: false, reason: "vision update" });
       }
     } catch (analysisError) {
@@ -871,7 +841,7 @@ function App() {
     } finally {
       analyzingRef.current = false;
     }
-  }, [apiFetch, autoGenerate, cameraOn, captureFrame, generateImage, generationTriggerMode, gestureEvents, strokes, transcript]);
+  }, [apiFetch, autoGenerate, cameraOn, captureFrame, generateImage, gestureEvents, strokes, transcript]);
 
   const startCamera = useCallback(async () => {
     setError("");
@@ -1021,7 +991,6 @@ function App() {
           .map((handGestures) => handGestures?.[0])
           .filter(Boolean);
         topGestures.forEach((gesture) => addGesture(gesture.categoryName, gesture.score));
-        const openHandCount = topGestures.filter((gesture) => isOpenHandGesture(gesture.categoryName)).length;
 
         const activeTips = landmarks.map((hand) => hand?.[8]).filter(Boolean);
         if (activeTips.length) {
@@ -1037,30 +1006,8 @@ function App() {
 
           if (timestamp - lastHandMetaRef.current > 650) {
             lastHandMetaRef.current = timestamp;
-            const triggerCue = generationTriggerMode === "hands"
-              ? ` | ${openHandCount}/2 open`
-              : "";
-            setHandActivity(`${activeTips.length} hand${activeTips.length > 1 ? "s" : ""} active${triggerCue} | overlay ${overlaySideRef.current}`);
+            setHandActivity(`${activeTips.length} hand${activeTips.length > 1 ? "s" : ""} active | overlay ${overlaySideRef.current}`);
           }
-        }
-
-        const twoOpenHands = openHandCount >= 2;
-        if (!twoOpenHands) {
-          handTriggerArmedRef.current = true;
-        }
-        if (
-          twoOpenHands &&
-          handTriggerArmedRef.current &&
-          autoGenerate &&
-          generationTriggerMode === "hands" &&
-          !visualLocked &&
-          inFlightGenerationCountRef.current < MAX_PARALLEL_GENERATIONS &&
-          Date.now() - lastHandTriggerRef.current > HAND_TRIGGER_COOLDOWN_MS
-        ) {
-          handTriggerArmedRef.current = false;
-          lastHandTriggerRef.current = Date.now();
-          flashHandTriggerCue();
-          generateImage({ force: false, reason: "two open hands" });
         }
 
         if (isDrawing) {
@@ -1095,14 +1042,10 @@ function App() {
 
     rafRef.current = requestAnimationFrame(drawFrame);
     return () => cancelAnimationFrame(rafRef.current);
-  }, [addGesture, autoGenerate, cameraOn, flashHandTriggerCue, generateImage, generationTriggerMode, isDrawing, visualLocked]);
+  }, [addGesture, cameraOn, isDrawing]);
 
   useEffect(() => {
-    return () => window.clearTimeout(handTriggerCueTimeoutRef.current);
-  }, []);
-
-  useEffect(() => {
-    if (!autoGenerate || visualLocked || generationTriggerMode !== "continuous") return;
+    if (!autoGenerate || visualLocked) return;
     const timer = window.setInterval(() => {
       const hasContext = transcript.trim().length > 12 || gestureEvents.length > 0 || strokes.length > 0 || visualAnalysis.trim().length > 0;
       const contextChanged = contextFingerprint !== lastContextFingerprintRef.current;
@@ -1113,7 +1056,7 @@ function App() {
     }, 2000);
 
     return () => window.clearInterval(timer);
-  }, [autoGenerate, contextFingerprint, generateImage, generationTriggerMode, gestureEvents.length, strokes.length, transcript, visualAnalysis, visualLocked]);
+  }, [autoGenerate, contextFingerprint, generateImage, gestureEvents.length, strokes.length, transcript, visualAnalysis, visualLocked]);
 
   useEffect(() => {
     if (!cameraOn || !autoGenerate) return;
@@ -1156,8 +1099,6 @@ function App() {
     setGenerationQueue([]);
     setGenerationMetrics(null);
     setVisualLocked(false);
-    window.clearTimeout(handTriggerCueTimeoutRef.current);
-    setHandTriggerCue(null);
     setAnalysisStatus(cameraOn ? "waiting for frame" : "waiting for camera");
     setStatus("Context cleared");
   }, [cameraOn, setTranscript, updateImage]);
@@ -1183,22 +1124,37 @@ function App() {
           <video ref={videoRef} playsInline muted />
           <canvas ref={canvasRef} />
           {!cameraOn && <div className="camera-empty">Camera preview appears here</div>}
-          {handTriggerCue && (
-            <div key={handTriggerCue.id} className="hand-trigger-cue" role="status" aria-live="polite">
-              <span />
-              <div>
-                <strong>{handTriggerCue.title}</strong>
-                <small>{handTriggerCue.detail}</small>
-              </div>
-            </div>
-          )}
-
           {!betaReady && (
             <section className="access-gate" role="dialog" aria-labelledby="access-title">
-              <div>
-                <h2 id="access-title">Public beta access</h2>
-                <p>Camera, microphone, transcript, prompt, and frame context may be sent to configured AI providers during this beta.</p>
+              <div className="access-header">
+                <span>Public beta setup</span>
+                <h2 id="access-title">Get LiveFlow ready</h2>
+                <p>LiveFlow uses your camera, microphone, transcript, prompt, and frame context to generate lesson visuals.</p>
               </div>
+
+              <ol className="access-steps" aria-label="Setup steps">
+                <li className={betaStatus.authenticated ? "complete" : "active"}>
+                  <span>1</span>
+                  <div>
+                    <strong>Enter beta</strong>
+                    <small>{betaStatus.authenticated ? "Access confirmed" : "Use your invite code"}</small>
+                  </div>
+                </li>
+                <li className={betaStatus.authenticated && !privacyAccepted ? "active" : betaReady ? "complete" : ""}>
+                  <span>2</span>
+                  <div>
+                    <strong>Review consent</strong>
+                    <small>Confirm provider processing</small>
+                  </div>
+                </li>
+                <li>
+                  <span>3</span>
+                  <div>
+                    <strong>Start live</strong>
+                    <small>Begin camera and speech capture</small>
+                  </div>
+                </li>
+              </ol>
 
               {!betaStatus.authenticated && (
                 <form onSubmit={submitBetaAccess} className="access-form">
@@ -1217,7 +1173,10 @@ function App() {
               {betaStatus.authenticated && (
                 <label className="consent-check">
                   <input type="checkbox" checked={privacyAccepted} onChange={(event) => setPrivacyAccepted(event.target.checked)} />
-                  <span>I understand and consent to beta provider processing.</span>
+                  <span>
+                    <strong>Allow beta provider processing</strong>
+                    <small>I understand lesson context may be sent to configured AI providers while using this beta.</small>
+                  </span>
                 </label>
               )}
 
@@ -1328,16 +1287,6 @@ function App() {
             </div>
 
             <div className="dock-group dock-modes">
-              <div className="segmented trigger-mode">
-                {[
-                  ["continuous", "Continuous"],
-                  ["hands", "2 hands"]
-                ].map(([value, label]) => (
-                  <button key={value} className={generationTriggerMode === value ? "selected" : ""} onClick={() => setTriggerMode(value)}>
-                    {label}
-                  </button>
-                ))}
-              </div>
               <div className="segmented provider-mode">
                 {enabledProviderOptions.map((option) => (
                   <button key={option.value} className={imageProvider === option.value ? "selected" : ""} onClick={() => setImageProvider(option.value)}>
