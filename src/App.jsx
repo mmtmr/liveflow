@@ -23,6 +23,7 @@ const IMAGE_PROVIDER_OPTIONS = [
   { value: "mermaid", label: "Mermaid" }
 ];
 const DEFAULT_IMAGE_PROVIDERS = ["openai", "mermaid"];
+const APP_VERSION_LABEL = `v${__APP_VERSION__}${__APP_COMMIT__ ? ` · ${__APP_COMMIT__}` : ""}`;
 
 const MERMAID_CONFIG = {
   startOnLoad: false,
@@ -1317,6 +1318,10 @@ function App() {
                 Clear
               </button>
             </div>
+          </div>
+
+          <div className="version-hint" aria-label={`LiveFlow version ${APP_VERSION_LABEL}`}>
+            {APP_VERSION_LABEL}
           </div>
         </div>
       </section>
